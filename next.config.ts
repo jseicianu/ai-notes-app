@@ -1,7 +1,11 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  serverExternalPackages: [
+    "pdf-parse",
+    "@extractus/article-extractor",
+    "ajv",
+  ],
 };
 
 export default nextConfig;
