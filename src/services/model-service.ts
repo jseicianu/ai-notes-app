@@ -5,7 +5,7 @@ import { createOpenAI, openai } from "@ai-sdk/openai";
 const DEFAULT_ANTHROPIC_MODEL = "claude-sonnet-4-6";
 const DEFAULT_OPENAI_MODEL = "gpt-4o-mini";
 const DEFAULT_GOOGLE_MODEL = "gemini-2.0-flash";
-const DEFAULT_LOCAL_MODEL = "gemma3:27b";
+const DEFAULT_LOCAL_MODEL = "gemma4:31b";
 
 export type ModelProvider = "anthropic" | "openai" | "google" | "local";
 
