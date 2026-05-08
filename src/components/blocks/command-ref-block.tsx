@@ -404,18 +404,17 @@ export function CommandRefBlock({ block, onUpdate, onRunComplete, onRunningChang
               return (
                 <div
                   key={`source-${i}`}
-                  className="flex items-center h-9 rounded-md border border-blue-200 bg-white"
+                  className="inline-flex items-center gap-1.5 h-9 pl-2 pr-1.5 rounded-lg bg-blue-50 border border-blue-200"
                 >
-                  <span className="px-2.5 flex items-center gap-1.5 h-full border-r border-blue-100">
-                    <BlockTypeIcon blockType={blockType} />
-                  </span>
-                  <span className="px-2.5 text-[12px] font-medium text-blue-700 truncate max-w-[160px]">
+                  <BlockTypeIcon blockType={blockType} />
+                  <span className="text-[13px] font-medium text-gray-900 truncate max-w-[160px]">
                     {label}
                   </span>
                   <span
                     onClick={() => updateSources(selectedSources.filter((_, j) => j !== i))}
-                    className="px-2 h-full flex items-center text-blue-400 hover:text-blue-600
-                               cursor-pointer border-l border-blue-100"
+                    className="h-5 w-5 flex items-center justify-center rounded-full
+                               text-gray-400 hover:text-gray-600 hover:bg-blue-100
+                               cursor-pointer ml-0.5"
                   >
                     <X className="h-3 w-3" />
                   </span>
