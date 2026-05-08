@@ -127,88 +127,6 @@ const SOURCE_TYPE_LABELS: Record<string, string> = {
   file: "File", url: "Web Page", block: "Block", paste: "Pasted Text",
 };
 
-function SourceChip({
-  source,
-  onRemove,
-  pageBlocks,
-}: {
-  source: SourceItem;
-  onRemove: () => void;
-  pageBlocks: Block[];
-}) {
-  const [showPreview, setShowPreview] = useState(false);
-  const hoverTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  const block = source.ref.type === "block"
-    ? pageBlocks.find((b) => b.id === (source.ref as { type: "block"; blockId: string }).blockId)
-    : null;
-
-  const blockType = block?.type || source.sourceType;
-  const label = block
-    ? SOURCE_TYPE_LABELS[block.type] || block.type
-    : source.label;
-
-  const handleMouseEnter = useCallback(() => {
-    hoverTimer.current = setTimeout(() => setShowPreview(true), 300);
-  }, []);
-
-  const handleMouseLeave = useCallback(() => {
-    if (hoverTimer.current) clearTimeout(hoverTimer.current);
-    setShowPreview(false);
-  }, []);
-
-  useEffect(() => {
-    return () => { if (hoverTimer.current) clearTimeout(hoverTimer.current); };
-  }, []);
-
-  const previewText = block ? getContentPreview(block) : source.label;
-
-  return (
-    <div className="relative inline-block">
-      <div
-        onMouseEnter={handleMouseEnter}
-        onMouseLeave={handleMouseLeave}
-        className="inline-flex items-center gap-1.5 h-9 pl-2 pr-2.5 rounded-md border
-                   border-blue-200 bg-white shadow-sm hover:border-blue-300 transition-all cursor-default"
-      >
-        <BlockTypeIcon blockType={blockType} />
-        <span className="text-[12px] font-medium text-blue-700 truncate max-w-[160px]">
-          {label}
-        </span>
-        <span
-          onClick={onRemove}
-          className="h-4 w-4 flex items-center justify-center rounded-full
-                     text-blue-400 hover:text-blue-600 hover:bg-blue-100
-                     transition-colors cursor-pointer ml-0.5"
-        >
-          <X className="h-2.5 w-2.5" />
-        </span>
-      </div>
-
-      {showPreview && previewText && (
-        <div
-          onMouseEnter={handleMouseEnter}
-          onMouseLeave={handleMouseLeave}
-          className="absolute left-0 top-full mt-2 w-72 bg-white border border-gray-200
-                     rounded-lg shadow-xl z-50 overflow-hidden
-                     animate-in fade-in zoom-in-95 duration-200"
-        >
-          <div className="flex items-center gap-2 px-3 py-2 border-b border-gray-100 bg-gray-50/50">
-            <BlockTypeIcon blockType={blockType} />
-            <span className="text-[12px] font-medium text-gray-700">{label}</span>
-            <span className="text-[10px] text-gray-400 ml-auto">Preview</span>
-          </div>
-          <div className="px-3 py-2.5 max-h-40 overflow-y-auto">
-            <p className="text-[12px] text-gray-600 leading-relaxed whitespace-pre-wrap line-clamp-8">
-              {previewText}
-            </p>
-          </div>
-        </div>
-      )}
-    </div>
-  );
-}
-
 function getContentPreview(block: Block, maxLen = 300): string {
   const c = block.content;
   if (!c) return "";
@@ -250,7 +168,9 @@ export function CommandRefBlock({ block, onUpdate, onRunComplete, onRunningChang
   const [runState, setRunState] = useState<RunState>(null);
   const [outputText, setOutputText] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [selectedSources, setSelectedSources] = useState<SourceItem[]>([]);
+  const [selectedSources, setSelectedSources] = useState<SourceItem[]>(
+    (block.content?.sources as SourceItem[]) || []
+  );
   const [showSourcePicker, setShowSourcePicker] = useState(false);
   const sourcePickerRef = useRef<HTMLDivElement>(null);
   const outerRef = useRef<HTMLDivElement>(null);
@@ -302,6 +222,14 @@ export function CommandRefBlock({ block, onUpdate, onRunComplete, onRunningChang
         setTimeout(() => onUpdate({ ...block.content, inputs: next }), 0);
         return next;
       });
+    },
+    [block.content, onUpdate]
+  );
+
+  const updateSources = useCallback(
+    (sources: SourceItem[]) => {
+      setSelectedSources(sources);
+      setTimeout(() => onUpdate({ ...block.content, sources }), 0);
     },
     [block.content, onUpdate]
   );
@@ -463,28 +391,37 @@ export function CommandRefBlock({ block, onUpdate, onRunComplete, onRunningChang
           <div className="flex items-center gap-3 flex-wrap">
             <span className="text-[13px] font-semibold text-gray-500 shrink-0">Inputs</span>
 
-            {/* Source chips — stacked, fan out on hover */}
-            {hasSourceConfig && selectedSources.length > 0 && (
-              <div className="source-stack relative flex items-center">
-                <style>{`
-                  .source-stack > .source-card + .source-card { margin-left: -28px; transition: margin 200ms ease-out; }
-                  .source-stack:hover > .source-card + .source-card { margin-left: 4px; }
-                `}</style>
-                {selectedSources.map((source, i) => (
-                  <div
-                    key={`source-${i}`}
-                    className="source-card"
-                    style={{ zIndex: i + 1 }}
+            {/* Source chips — inline pills */}
+            {hasSourceConfig && selectedSources.map((source, i) => {
+              const refBlock = source.ref.type === "block"
+                ? pageBlocks.find((b) => b.id === (source.ref as { type: "block"; blockId: string }).blockId)
+                : null;
+              const label = refBlock
+                ? (SOURCE_TYPE_LABELS[refBlock.type] || refBlock.type)
+                : source.label;
+              const blockType = refBlock?.type || source.sourceType;
+
+              return (
+                <div
+                  key={`source-${i}`}
+                  className="flex items-center h-9 rounded-md border border-blue-200 bg-white"
+                >
+                  <span className="px-2.5 flex items-center gap-1.5 h-full border-r border-blue-100">
+                    <BlockTypeIcon blockType={blockType} />
+                  </span>
+                  <span className="px-2.5 text-[12px] font-medium text-blue-700 truncate max-w-[160px]">
+                    {label}
+                  </span>
+                  <span
+                    onClick={() => updateSources(selectedSources.filter((_, j) => j !== i))}
+                    className="px-2 h-full flex items-center text-blue-400 hover:text-blue-600
+                               cursor-pointer border-l border-blue-100"
                   >
-                    <SourceChip
-                      source={source}
-                      onRemove={() => setSelectedSources((prev) => prev.filter((_, j) => j !== i))}
-                      pageBlocks={pageBlocks}
-                    />
-                  </div>
-                ))}
-              </div>
-            )}
+                    <X className="h-3 w-3" />
+                  </span>
+                </div>
+              );
+            })}
 
             {/* Add source button — when sourceConfig exists */}
             {hasSourceConfig && (
@@ -504,7 +441,7 @@ export function CommandRefBlock({ block, onUpdate, onRunComplete, onRunningChang
                   <div className="absolute left-0 top-full mt-1.5 z-[200]">
                     <SourcePickerPopover
                       sources={selectedSources}
-                      onSourcesChange={setSelectedSources}
+                      onSourcesChange={updateSources}
                       pageBlocks={pageBlocks}
                       onClose={() => setShowSourcePicker(false)}
                       workspaceId={block.workspace_id}
