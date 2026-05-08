@@ -407,7 +407,7 @@ export function CommandRefBlock({ block, onUpdate, onRunComplete, onRunningChang
                   className="inline-flex items-center gap-1.5 h-9 pl-2 pr-1.5 rounded-lg bg-blue-50 border border-blue-200"
                 >
                   <BlockTypeIcon blockType={blockType} />
-                  <span className="text-[13px] font-medium text-gray-900 truncate max-w-[160px]">
+                  <span className="text-[13px] font-medium text-blue-600 truncate max-w-[160px]">
                     {label}
                   </span>
                   <span
