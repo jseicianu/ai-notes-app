@@ -6,6 +6,7 @@ import {
   Terminal,
   FolderOpen,
   Activity,
+  Clock,
   Settings,
   ChevronRight,
   ChevronDown,
@@ -19,8 +20,10 @@ import {
   PanelLeftClose,
   PanelLeft,
   Star,
+  Search,
 } from "lucide-react";
 import { CommandLibrary } from "./command-library";
+import { createClient } from "@/lib/supabase/client";
 import type { Command, Notebook, Page } from "@/lib/models/types";
 import {
   Tooltip,
@@ -43,9 +46,11 @@ interface SidebarProps {
   onCreatePage: (notebookId: string) => void;
   onInsertCommand?: (command: Command) => void;
   onEditCommand?: (command: Command) => void;
+  activeNav: "pages" | "commands" | "files" | "runs" | "schedules" | "settings";
   collapsed: boolean;
   onToggleCollapse: () => void;
-  onNavChange?: (nav: "pages" | "commands" | "files" | "runs" | "settings") => void;
+  onNavChange?: (nav: "pages" | "commands" | "files" | "runs" | "schedules" | "settings") => void;
+  onOpenPalette?: () => void;
 }
 
 /* ─── Nav item ─── */
@@ -122,6 +127,7 @@ function NotebookTreeSection({
   onToggle,
   onPageSelect,
   onCreatePage,
+  onDeleteNotebook,
 }: {
   notebook: Notebook;
   notebookPages: Page[];
@@ -130,6 +136,7 @@ function NotebookTreeSection({
   onToggle: () => void;
   onPageSelect: (pageId: string) => void;
   onCreatePage: () => void;
+  onDeleteNotebook?: (notebookId: string) => void;
 }) {
   const [hovered, setHovered] = useState(false);
   const [showMenu, setShowMenu] = useState(false);
@@ -215,7 +222,10 @@ function NotebookTreeSection({
               Rename
             </button>
             <button
-              onClick={() => setShowMenu(false)}
+              onClick={() => {
+                setShowMenu(false);
+                onDeleteNotebook?.(notebook.id);
+              }}
               className="flex w-full items-center gap-2 px-3 py-1.5 text-[13px]
                          text-red-500 hover:bg-red-50 cursor-pointer transition-colors"
             >
@@ -343,15 +353,16 @@ export function Sidebar({
   onCreatePage,
   onInsertCommand,
   onEditCommand,
+  activeNav,
   collapsed,
   onToggleCollapse,
   onNavChange,
+  onOpenPalette,
 }: SidebarProps) {
   const [expandedNotebooks, setExpandedNotebooks] = useState<Set<string>>(
     new Set(notebooks.map((n) => n.id))
   );
-  const [showCommands, setShowCommands] = useState(false);
-  const [activeNav, setActiveNav] = useState<"pages" | "commands" | "files" | "runs" | "settings">("pages");
+  const showCommands = activeNav === "commands";
 
   const starredPages = useMemo(() => {
     const all: Page[] = [];
@@ -362,6 +373,13 @@ export function Sidebar({
     }
     return all;
   }, [pages]);
+
+  const supabase = useMemo(() => createClient(), []);
+
+  const handleDeleteNotebook = useCallback(async (notebookId: string) => {
+    await supabase.from("notebooks").update({ is_archived: true }).eq("id", notebookId);
+    window.location.reload();
+  }, [supabase]);
 
   const toggleNotebook = useCallback((id: string) => {
     setExpandedNotebooks((prev) => {
@@ -444,37 +462,62 @@ export function Sidebar({
         </div>
       </div>
 
+      {/* ── Search trigger ── */}
+      <div className="px-3 pb-2 shrink-0">
+        <button
+          onClick={onOpenPalette}
+          className="flex w-full items-center gap-2.5 px-3 py-[7px] rounded-md
+                     border border-gray-200 bg-gray-50/50
+                     text-[13px] text-gray-400
+                     hover:bg-gray-100 hover:border-gray-300
+                     transition-all duration-150 cursor-pointer"
+        >
+          <Search className="h-[14px] w-[14px] shrink-0" />
+          <span className="flex-1 text-left">Search</span>
+          <kbd className="px-1.5 py-0.5 rounded bg-white border border-gray-200
+                          text-[10px] font-medium text-gray-400">
+            ⌘K
+          </kbd>
+        </button>
+      </div>
+
       {/* ── Primary nav ── */}
       <div className="px-3 pb-1 shrink-0 space-y-0.5">
         <NavItem
           icon={FileText}
           label="Pages"
           active={activeNav === "pages" && !showCommands}
-          onClick={() => { setActiveNav("pages"); setShowCommands(false); onNavChange?.("pages"); }}
+          onClick={() => onNavChange?.("pages")}
         />
         <NavItem
           icon={Terminal}
           label="Commands"
           active={showCommands}
-          onClick={() => { setShowCommands(true); onNavChange?.("commands"); }}
+          onClick={() => onNavChange?.("commands")}
         />
         <NavItem
           icon={FolderOpen}
           label="Files"
           active={activeNav === "files"}
-          onClick={() => { setActiveNav("files"); setShowCommands(false); onNavChange?.("files"); }}
+          onClick={() => onNavChange?.("files")}
         />
         <NavItem
           icon={Activity}
           label="Runs"
           active={activeNav === "runs"}
-          onClick={() => { setActiveNav("runs"); setShowCommands(false); onNavChange?.("runs"); }}
+          onClick={() => onNavChange?.("runs")}
+        />
+        <NavItem
+          icon={Clock}
+          label="Schedules"
+          active={activeNav === "schedules"}
+          onClick={() => onNavChange?.("schedules")}
         />
         <NavItem
           icon={Settings}
           label="Settings"
           active={activeNav === "settings"}
-          onClick={() => { setActiveNav("settings"); setShowCommands(false); onNavChange?.("settings"); }}
+          onClick={() => onNavChange?.("settings")}
         />
       </div>
 
@@ -484,10 +527,9 @@ export function Sidebar({
       {showCommands && workspaceId ? (
         <CommandLibrary
           workspaceId={workspaceId}
-          onBack={() => setShowCommands(false)}
+          onBack={() => onNavChange?.("pages")}
           onInsertCommand={(cmd) => {
             onInsertCommand?.(cmd);
-            setShowCommands(false);
           }}
           onEditCommand={(cmd) => {
             onEditCommand?.(cmd);
@@ -547,6 +589,7 @@ export function Sidebar({
                 onToggle={() => toggleNotebook(notebook.id)}
                 onPageSelect={onPageSelect}
                 onCreatePage={() => onCreatePage(notebook.id)}
+                onDeleteNotebook={handleDeleteNotebook}
               />
             ))}
 

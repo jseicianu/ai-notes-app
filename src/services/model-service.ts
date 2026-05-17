@@ -25,6 +25,7 @@ export function getModel(
   modelName?: string,
   options?: ModelOptions
 ) {
+  const effectiveModelName = modelName === "local-ollama" ? undefined : modelName;
   switch (provider) {
     case "openai": {
       const providerInstance = options?.apiKey || options?.apiKeys?.openai
@@ -32,7 +33,7 @@ export function getModel(
         : openai;
 
       return providerInstance(
-        modelName || process.env.OPENAI_MODEL_NAME || DEFAULT_OPENAI_MODEL
+        effectiveModelName || process.env.OPENAI_MODEL_NAME || DEFAULT_OPENAI_MODEL
       );
     }
     case "google": {
@@ -43,7 +44,7 @@ export function getModel(
         : google;
 
       return providerInstance(
-        modelName || process.env.GOOGLE_MODEL_NAME || DEFAULT_GOOGLE_MODEL
+        effectiveModelName || process.env.GOOGLE_MODEL_NAME || DEFAULT_GOOGLE_MODEL
       );
     }
     case "local": {
@@ -58,7 +59,7 @@ export function getModel(
       });
 
       return localProvider(
-        modelName ||
+        effectiveModelName ||
           options?.localModelName ||
           process.env.LOCAL_MODEL_NAME ||
           DEFAULT_LOCAL_MODEL
@@ -73,7 +74,7 @@ export function getModel(
         : anthropic;
 
       return providerInstance(
-        modelName || process.env.ANTHROPIC_MODEL_NAME || DEFAULT_ANTHROPIC_MODEL
+        effectiveModelName || process.env.ANTHROPIC_MODEL_NAME || DEFAULT_ANTHROPIC_MODEL
       );
     }
   }
@@ -119,4 +120,41 @@ export function listAvailableModels(): { provider: string; models: string[] }[] 
       models: [process.env.LOCAL_MODEL_NAME || DEFAULT_LOCAL_MODEL],
     },
   ];
+}
+
+export function supportsVision(provider: string, model: string): boolean {
+  const normalizedProvider = provider.toLowerCase();
+  const normalizedModel = model.toLowerCase();
+
+  if (normalizedProvider === "anthropic") {
+    return (
+      normalizedModel.includes("claude-3") ||
+      normalizedModel.includes("claude-sonnet") ||
+      normalizedModel.includes("claude-opus")
+    );
+  }
+
+  if (normalizedProvider === "openai") {
+    return (
+      normalizedModel.includes("gpt-4o") ||
+      normalizedModel.includes("gpt-4-turbo") ||
+      normalizedModel.includes("gpt-4.1")
+    );
+  }
+
+  if (normalizedProvider === "google") {
+    return (
+      normalizedModel.includes("gemini-1.5") ||
+      normalizedModel.includes("gemini-2.")
+    );
+  }
+
+  if (normalizedProvider === "local") {
+    return (
+      normalizedModel.includes("llava") ||
+      normalizedModel.includes("vision")
+    );
+  }
+
+  return false;
 }

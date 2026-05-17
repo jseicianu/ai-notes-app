@@ -1,9 +1,18 @@
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
-import { createCommand } from "@/services/command-service";
+import { createCommand, updateCommand } from "@/services/command-service";
 
 export const runtime = "nodejs";
+
+const validationRuleSchema = z.object({
+  min: z.number().optional(),
+  max: z.number().optional(),
+  minLength: z.number().optional(),
+  maxLength: z.number().optional(),
+  pattern: z.string().optional(),
+  patternMessage: z.string().optional(),
+});
 
 const commandSchema = z.object({
   workspaceId: z.string().uuid(),
@@ -21,6 +30,8 @@ const commandSchema = z.object({
       min: z.number().optional(),
       max: z.number().optional(),
       options: z.array(z.string()).optional(),
+      input_mode: z.enum(["source", "text"]).optional(),
+      validation: validationRuleSchema.optional(),
     })
   ),
   outputSchema: z.record(z.string(), z.unknown()).default({}),
@@ -130,28 +141,39 @@ export async function PUT(request: NextRequest) {
     return NextResponse.json({ error: "Command not found" }, { status: 404 });
   }
 
-  const { data, error } = await supabase
-    .from("commands")
-    .update({
+  const { data: workspace } = await supabase
+    .from("workspaces")
+    .select("id")
+    .eq("id", body.workspaceId)
+    .eq("owner_id", user.id)
+    .single();
+
+  if (!workspace) {
+    return NextResponse.json(
+      { error: "Workspace not found" },
+      { status: 404 }
+    );
+  }
+
+  try {
+    const command = await updateCommand(id, {
       name: body.name,
       slug: body.slug,
-      description: body.description || null,
+      description: body.description,
       prompt_template: body.promptTemplate,
       inputs: body.inputs,
       output_schema: body.outputSchema,
       allowed_tools: body.allowedTools,
       context_config: body.contextConfig,
-      model_provider: body.modelProvider || null,
-      model_name: body.modelName || null,
-      updated_at: new Date().toISOString(),
-    })
-    .eq("id", id)
-    .select()
-    .single();
+      model_provider: body.modelProvider,
+      model_name: body.modelName,
+      source_run_id: body.sourceRunId,
+    });
 
-  if (error) {
-    return NextResponse.json({ error: error.message }, { status: 400 });
+    return NextResponse.json(command);
+  } catch (err) {
+    const message =
+      err instanceof Error ? err.message : "Failed to update command";
+    return NextResponse.json({ error: message }, { status: 400 });
   }
-
-  return NextResponse.json(data);
 }

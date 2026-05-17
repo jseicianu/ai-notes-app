@@ -3,6 +3,7 @@
 import { useState, useRef, useEffect, useMemo, useCallback } from "react";
 import { CornerDownRight, X } from "lucide-react";
 import { BlockTypeIcon } from "./block-wrapper";
+import { getBlockNumberMap } from "./block-display-order";
 import type { Block } from "@/lib/models/types";
 
 const EXCLUDED_TYPES = new Set([
@@ -273,17 +274,7 @@ export function BlockReferencePicker({
     [value, blocks]
   );
 
-  const blockNumberMap = useMemo(() => {
-    const map = new Map<string, number>();
-    let num = 1;
-    for (const b of blocks) {
-      if (b.type !== "output" && b.type !== "error") {
-        map.set(b.id, num);
-        num++;
-      }
-    }
-    return map;
-  }, [blocks]);
+  const blockNumberMap = useMemo(() => getBlockNumberMap(blocks), [blocks]);
 
   return (
     <div className="relative inline-block" ref={containerRef}>

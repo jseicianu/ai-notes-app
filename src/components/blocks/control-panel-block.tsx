@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
-import { Plus, X, ChevronDown, FileText, Globe, Type, ClipboardPaste } from "lucide-react";
+import { Plus, X, ChevronDown, FileText, Globe, Type, ClipboardPaste, ImageIcon } from "lucide-react";
 import { SourcePickerPopover } from "./source-picker-popover";
 import type { SourceItem } from "./source-picker-popover";
 import type { Block } from "@/lib/models/types";
@@ -18,6 +18,7 @@ interface ControlPanelBlockProps {
   onUpdate: (content: Record<string, unknown>) => void;
   embedded?: boolean;
   pageBlocks?: Block[];
+  onSourceCardsReady?: () => void | Promise<void>;
 }
 
 const INPUT_TYPE_OPTIONS = [
@@ -52,13 +53,40 @@ function getDefaultConfig(type: string): Record<string, unknown> {
   }
 }
 
-export function ControlPanelBlock({ block, onUpdate, pageBlocks = [] }: ControlPanelBlockProps) {
+export function ControlPanelBlock({
+  block,
+  onUpdate,
+  pageBlocks = [],
+  onSourceCardsReady,
+}: ControlPanelBlockProps) {
   const inputs = useMemo(
     () => (block.content?.inputs as PanelInput[] | undefined) ?? [],
     [block.content?.inputs]
   );
   const [editingLabel, setEditingLabel] = useState<number | null>(null);
   const [showAddMenu, setShowAddMenu] = useState(false);
+  const addMenuContainerRef = useRef<HTMLDivElement>(null);
+
+  const closeAddMenuIfOutside = useCallback((target: EventTarget | null) => {
+    if (
+      target instanceof Node &&
+      addMenuContainerRef.current &&
+      !addMenuContainerRef.current.contains(target)
+    ) {
+      setShowAddMenu(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!showAddMenu) return;
+
+    function handlePointerDown(event: PointerEvent) {
+      closeAddMenuIfOutside(event.target);
+    }
+
+    document.addEventListener("pointerdown", handlePointerDown, true);
+    return () => document.removeEventListener("pointerdown", handlePointerDown, true);
+  }, [showAddMenu, closeAddMenuIfOutside]);
 
   const updateInputs = useCallback(
     (newInputs: PanelInput[]) => {
@@ -110,11 +138,22 @@ export function ControlPanelBlock({ block, onUpdate, pageBlocks = [] }: ControlP
 
   if (inputs.length === 0) {
     return (
-      <div className="px-4 py-6 flex flex-col items-center gap-2">
+      <div
+        className="px-4 py-6 flex flex-col items-center gap-2"
+        onPointerDownCapture={(event) => closeAddMenuIfOutside(event.target)}
+      >
         <span className="text-[13px] text-gray-400">No controls yet</span>
-        <div className="relative">
+        {showAddMenu && (
           <button
-            onClick={() => setShowAddMenu(!showAddMenu)}
+            type="button"
+            aria-label="Close add control menu"
+            className="fixed inset-0 z-[999] cursor-default bg-transparent"
+            onClick={() => setShowAddMenu(false)}
+          />
+        )}
+        <div className={`relative ${showAddMenu ? "z-[1000]" : ""}`} ref={addMenuContainerRef}>
+          <button
+            onClick={() => setShowAddMenu((open) => !open)}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[13px] font-medium
                        text-blue-500 border border-blue-200 rounded-md
                        hover:bg-blue-50 transition-colors cursor-pointer"
@@ -124,7 +163,7 @@ export function ControlPanelBlock({ block, onUpdate, pageBlocks = [] }: ControlP
           </button>
           {showAddMenu && (
             <AddMenu onAdd={(type) => { addInput(type); setShowAddMenu(false); }}
-                     onClose={() => setShowAddMenu(false)} />
+                     />
           )}
         </div>
       </div>
@@ -132,7 +171,10 @@ export function ControlPanelBlock({ block, onUpdate, pageBlocks = [] }: ControlP
   }
 
   return (
-    <div className="px-4 py-4">
+    <div
+      className="px-4 py-4"
+      onPointerDownCapture={(event) => closeAddMenuIfOutside(event.target)}
+    >
       <div className="grid grid-cols-3 gap-x-6">
         {inputs.map((input, index) => (
           <div key={`${input.variable_name}-${index}`}
@@ -178,6 +220,7 @@ export function ControlPanelBlock({ block, onUpdate, pageBlocks = [] }: ControlP
               onValueChange={(value) => updateInputValue(index, value)}
               pageBlocks={pageBlocks}
               block={block}
+              onSourceCardsReady={onSourceCardsReady}
             />
 
             {/* Description */}
@@ -191,9 +234,18 @@ export function ControlPanelBlock({ block, onUpdate, pageBlocks = [] }: ControlP
 
         {/* Add button */}
         {inputs.length < 12 && (
-          <div className="flex items-end relative">
+          <>
+          {showAddMenu && (
             <button
-              onClick={() => setShowAddMenu(!showAddMenu)}
+              type="button"
+              aria-label="Close add control menu"
+              className="fixed inset-0 z-[999] cursor-default bg-transparent"
+              onClick={() => setShowAddMenu(false)}
+            />
+          )}
+          <div className={`flex items-end relative ${showAddMenu ? "z-[1000]" : ""}`} ref={addMenuContainerRef}>
+            <button
+              onClick={() => setShowAddMenu((open) => !open)}
               className="inline-flex items-center gap-1 px-2.5 py-1.5 text-[12px] font-medium
                          text-gray-400 border border-dashed border-gray-300 rounded-md
                          hover:text-blue-500 hover:border-blue-300
@@ -204,21 +256,21 @@ export function ControlPanelBlock({ block, onUpdate, pageBlocks = [] }: ControlP
             </button>
             {showAddMenu && (
               <AddMenu onAdd={(type) => { addInput(type); setShowAddMenu(false); }}
-                       onClose={() => setShowAddMenu(false)} />
+                       />
             )}
           </div>
+          </>
         )}
       </div>
     </div>
   );
 }
 
-function AddMenu({ onAdd, onClose }: { onAdd: (type: string) => void; onClose: () => void }) {
+function AddMenu({ onAdd }: { onAdd: (type: string) => void }) {
   return (
     <div
       className="absolute left-0 top-full mt-1 w-36 border border-gray-200 bg-white
                  rounded-lg shadow-lg z-50 py-1 animate-in fade-in slide-in-from-top-1 duration-100"
-      onMouseLeave={onClose}
     >
       {INPUT_TYPE_OPTIONS.map((opt) => (
         <button
@@ -240,6 +292,7 @@ const SOURCE_TYPE_ICONS_MAP = {
   url: Globe,
   block: Type,
   paste: ClipboardPaste,
+  image: ImageIcon,
 };
 
 function SourceControl({
@@ -247,11 +300,13 @@ function SourceControl({
   onValueChange,
   pageBlocks,
   block,
+  onSourceCardsReady,
 }: {
   value: unknown;
   onValueChange: (value: unknown) => void;
   pageBlocks: Block[];
   block: Block;
+  onSourceCardsReady?: () => void | Promise<void>;
 }) {
   const [showPicker, setShowPicker] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -323,7 +378,10 @@ function SourceControl({
             pageBlocks={pageBlocks}
             onClose={() => setShowPicker(false)}
             workspaceId={block.workspace_id}
+            pageId={block.page_id}
             triggerBlockId={block.id}
+            onSourceCardsReady={onSourceCardsReady}
+            onViewSourceCards={onSourceCardsReady}
           />
         </div>
       )}
@@ -336,11 +394,13 @@ function GridControl({
   onValueChange,
   pageBlocks,
   block,
+  onSourceCardsReady,
 }: {
   input: PanelInput;
   onValueChange: (value: unknown) => void;
   pageBlocks: Block[];
   block: Block;
+  onSourceCardsReady?: () => void | Promise<void>;
 }) {
   const { input_type, value, config } = input;
 
@@ -351,6 +411,7 @@ function GridControl({
         onValueChange={onValueChange}
         pageBlocks={pageBlocks}
         block={block}
+        onSourceCardsReady={onSourceCardsReady}
       />
     );
   }

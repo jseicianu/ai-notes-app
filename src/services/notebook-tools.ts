@@ -2,21 +2,28 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import { generateText, stepCountIs, tool, type LanguageModelUsage, type ToolSet } from "ai";
 import { z } from "zod";
 import { createClient } from "@/lib/supabase/server";
-import type { Block, BlockType, Command } from "@/lib/models/types";
+import { BlockType, type Block, type Command } from "@/lib/models/types";
 import { saveBlockVersion } from "@/services/block-version-service";
 import { fillTemplate, validateOutput } from "@/services/command-service";
-import { searchWorkspace } from "@/services/embedding-service";
+import { embedContent, searchWorkspace } from "@/services/embedding-service";
+import { generateImage, storeGeneratedImageBlock } from "@/services/image-gen-service";
 import { getModel, type ModelOptions } from "@/services/model-service";
 import { createRun, updateRunStatus } from "@/services/run-service";
-import { webScrape, webSearch } from "@/services/web-tools";
+import { extractYouTubeTranscript } from "@/services/youtube-service";
+import { createSourceSummary, fetchRemotePDF, isPdfUrl, webScrape, webSearch } from "@/services/web-tools";
 
 export interface NotebookToolsContext {
   workspaceId: string;
   pageId: string;
-  parentBlockId: string;
+  parentBlockId?: string | null;
   currentRunId: string;
+  existingOutputBlocks?: Array<{ id: string; type: string }>;
+  /** @deprecated Use existingOutputBlocks so reuse can be scoped by block type. */
   existingOutputBlockIds?: string[];
   supabase?: SupabaseClient;
+  tavilyApiKey?: string;
+  outputMode?: "replace" | "append" | "version";
+  openaiApiKey?: string;
   onBlockCreated?: (block: Block) => void;
   onToolUsed?: (toolName: string) => void;
 }
@@ -76,7 +83,7 @@ async function insertBlock(
     .insert({
       workspace_id: context.workspaceId,
       page_id: context.pageId,
-      parent_block_id: context.parentBlockId,
+      parent_block_id: context.parentBlockId || null,
       sort_order: sortOrder,
       type,
       content,
@@ -106,7 +113,7 @@ async function updateExistingOutputBlock(
 ) {
   const { data: existing, error: readError } = await supabase
     .from("blocks")
-    .select("id,workspace_id,page_id,type,content")
+    .select("id,workspace_id,page_id,parent_block_id,type,content")
     .eq("id", blockId)
     .eq("workspace_id", context.workspaceId)
     .eq("page_id", context.pageId)
@@ -116,7 +123,17 @@ async function updateExistingOutputBlock(
     throw new Error("Existing output block not found in workspace");
   }
 
-  await saveBlockVersion(blockId, supabase);
+  const parentScopedExisting = existing as { parent_block_id?: string | null };
+  if ((parentScopedExisting.parent_block_id ?? null) !== (context.parentBlockId ?? null)) {
+    throw new Error("Existing output block not found in workspace");
+  }
+  if (existing.type !== type) {
+    throw new Error(`Existing output block type mismatch: expected ${type}, found ${existing.type}`);
+  }
+
+  if (context.outputMode === "version") {
+    await saveBlockVersion(blockId, supabase);
+  }
 
   const { data, error } = await supabase
     .from("blocks")
@@ -131,6 +148,56 @@ async function updateExistingOutputBlock(
 
   if (error) throw new Error(error.message);
   return data as Block;
+}
+
+async function updateBlock(
+  context: NotebookToolsContext,
+  toolName: string,
+  blockId: string,
+  type: BlockType | undefined,
+  content: Record<string, unknown>
+) {
+  const supabase = await getSupabase(context.supabase);
+  const { data: existing, error: readError } = await supabase
+    .from("blocks")
+    .select("id,workspace_id,page_id,type,content")
+    .eq("id", blockId)
+    .eq("workspace_id", context.workspaceId)
+    .eq("page_id", context.pageId)
+    .single();
+
+  if (readError || !existing) {
+    throw new Error("Block not found in workspace");
+  }
+
+  if (context.outputMode === "version") {
+    await saveBlockVersion(blockId, supabase);
+  }
+
+  const updatePayload: Record<string, unknown> = {
+    content,
+    updated_at: new Date().toISOString(),
+  };
+  if (type) updatePayload.type = type;
+
+  const { data, error } = await supabase
+    .from("blocks")
+    .update(updatePayload)
+    .eq("id", blockId)
+    .select()
+    .single();
+
+  if (error) throw new Error(error.message);
+
+  const block = data as Block;
+  context.onToolUsed?.(toolName);
+  context.onBlockCreated?.(block);
+
+  return {
+    blockId: block.id,
+    type: block.type,
+    content: block.content,
+  };
 }
 
 async function validateParentBlock(
@@ -162,11 +229,85 @@ export function filterNotebookTools(
   ) as ToolSet;
 }
 
+function buildReusableOutputBlockMap(context: NotebookToolsContext): Map<BlockType, string[]> {
+  const map = new Map<BlockType, string[]>();
+  if (context.outputMode === "append") return map;
+
+  for (const block of context.existingOutputBlocks ?? []) {
+    const parsedType = BlockType.safeParse(block.type);
+    if (!parsedType.success) continue;
+    const list = map.get(parsedType.data) ?? [];
+    list.push(block.id);
+    map.set(parsedType.data, list);
+  }
+
+  return map;
+}
+
+function getReusableOutputBlockId(context: NotebookToolsContext, type: BlockType): string | undefined {
+  if (context.outputMode === "append") return undefined;
+  return context.existingOutputBlocks?.find((block) => block.type === type)?.id;
+}
+
 export function createNotebookTools(context: NotebookToolsContext): ToolSet {
-  const reusableOutputBlockIds = [...(context.existingOutputBlockIds ?? [])];
-  const nextExistingBlockId = () => reusableOutputBlockIds.shift();
+  const reusableOutputBlockMap = buildReusableOutputBlockMap(context);
+  const nextExistingBlockId = (type: BlockType) => {
+    const list = reusableOutputBlockMap.get(type);
+    return list?.shift();
+  };
 
   return {
+    update_block: tool({
+      description: "Update an existing notebook block in-place. Use this when refining or modifying a block that already exists.",
+      inputSchema: z.object({
+        blockId: z.string().uuid(),
+        content: z.record(z.string(), z.unknown()),
+        type: BlockType.optional(),
+      }),
+      execute: ({ blockId, content, type }) =>
+        updateBlock(context, "update_block", blockId, type, content),
+    }),
+
+    update_table: tool({
+      description: "Update an existing table block in-place with complete replacement columns and rows.",
+      inputSchema: z.object({
+        blockId: z.string().uuid(),
+        columns: z.array(z.string()).min(1),
+        rows: z.array(z.record(z.string(), z.string())),
+      }),
+      execute: ({ blockId, columns, rows }) =>
+        updateBlock(context, "update_table", blockId, "table", { columns, rows }),
+    }),
+
+    update_json: tool({
+      description: "Update an existing JSON block in-place.",
+      inputSchema: z.object({
+        blockId: z.string().uuid(),
+        data: z.record(z.string(), z.unknown()),
+        label: z.string().optional(),
+      }),
+      execute: ({ blockId, data, label }) =>
+        updateBlock(context, "update_json", blockId, "json", {
+          data,
+          ...(label ? { label } : {}),
+        }),
+    }),
+
+    update_todo: tool({
+      description: "Update an existing todo block in-place.",
+      inputSchema: z.object({
+        blockId: z.string().uuid(),
+        items: z.array(
+          z.object({
+            text: z.string(),
+            done: z.boolean(),
+          })
+        ),
+      }),
+      execute: ({ blockId, items }) =>
+        updateBlock(context, "update_todo", blockId, "todo", { items }),
+    }),
+
     create_text_output: tool({
       description: "Create a text output block linked to the current AI cell.",
       inputSchema: z.object({
@@ -176,7 +317,7 @@ export function createNotebookTools(context: NotebookToolsContext): ToolSet {
         insertBlock(context, "create_text_output", "output", {
           format: "text",
           data: content,
-        }, nextExistingBlockId()),
+        }, nextExistingBlockId("output")),
     }),
 
     create_table: tool({
@@ -186,7 +327,7 @@ export function createNotebookTools(context: NotebookToolsContext): ToolSet {
         rows: z.array(z.record(z.string(), z.string())),
       }),
       execute: ({ columns, rows }) =>
-        insertBlock(context, "create_table", "table", { columns, rows }, nextExistingBlockId()),
+        insertBlock(context, "create_table", "table", { columns, rows }, nextExistingBlockId("table")),
     }),
 
     create_json: tool({
@@ -199,7 +340,7 @@ export function createNotebookTools(context: NotebookToolsContext): ToolSet {
         insertBlock(context, "create_json", "json", {
           data,
           ...(label ? { label } : {}),
-        }, nextExistingBlockId()),
+        }, nextExistingBlockId("json")),
     }),
 
     create_todo: tool({
@@ -213,7 +354,7 @@ export function createNotebookTools(context: NotebookToolsContext): ToolSet {
         ),
       }),
       execute: ({ items }) =>
-        insertBlock(context, "create_todo", "todo", { items }, nextExistingBlockId()),
+        insertBlock(context, "create_todo", "todo", { items }, nextExistingBlockId("todo")),
     }),
 
     create_bulleted_list: tool({
@@ -224,7 +365,7 @@ export function createNotebookTools(context: NotebookToolsContext): ToolSet {
       execute: ({ items }) =>
         insertBlock(context, "create_bulleted_list", "bulleted_list", {
           doc: `<ul>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ul>`,
-        }, nextExistingBlockId()),
+        }, nextExistingBlockId("bulleted_list")),
     }),
 
     create_numbered_list: tool({
@@ -235,7 +376,7 @@ export function createNotebookTools(context: NotebookToolsContext): ToolSet {
       execute: ({ items }) =>
         insertBlock(context, "create_numbered_list", "numbered_list", {
           doc: `<ol>${items.map((item) => `<li>${escapeHtml(item)}</li>`).join("")}</ol>`,
-        }, nextExistingBlockId()),
+        }, nextExistingBlockId("numbered_list")),
     }),
 
     create_callout: tool({
@@ -248,7 +389,7 @@ export function createNotebookTools(context: NotebookToolsContext): ToolSet {
         insertBlock(context, "create_callout", "callout", {
           type,
           doc: content,
-        }, nextExistingBlockId()),
+        }, nextExistingBlockId("callout")),
     }),
 
     create_source_card: tool({
@@ -264,7 +405,75 @@ export function createNotebookTools(context: NotebookToolsContext): ToolSet {
           title,
           summary,
           scraped_at: new Date().toISOString(),
-        }, nextExistingBlockId()),
+        }, nextExistingBlockId("source_card")),
+    }),
+
+    create_code_output: tool({
+      description: "Create a syntax-highlighted code block. Use this when outputting code snippets, scripts, or configuration files instead of putting code in a text block.",
+      inputSchema: z.object({
+        code: z.string().describe("The code content"),
+        language: z.enum(["javascript", "typescript", "python", "json", "html", "css", "sql", "markdown", "bash", "plain"]).describe("Programming language for syntax highlighting"),
+        description: z.string().optional().describe("Brief description of what the code does"),
+      }),
+      execute: ({ code, language, description }) =>
+        insertBlock(context, "create_code_output", "code", {
+          code,
+          language,
+          ...(description ? { description } : {}),
+        }, nextExistingBlockId("code")),
+    }),
+
+    generate_image: tool({
+      description: "Generate an image and create an image block linked to the current AI cell. Use this whenever the user asks to create, generate, draw, design, or illustrate an image.",
+      inputSchema: z.object({
+        prompt: z.string().min(1).describe("A clear visual prompt for the image generator."),
+        caption: z.string().optional().describe("Optional caption to show under the image block."),
+        size: z.enum(["1024x1024", "1536x1024", "1024x1536"]).default("1024x1024").describe("Image dimensions."),
+        quality: z.enum(["low", "medium", "high"]).default("medium").describe("Image generation quality."),
+      }),
+      execute: async ({ prompt, caption, size, quality }) => {
+        context.onToolUsed?.("generate_image");
+
+        try {
+          const supabase = await getSupabase(context.supabase);
+          await validateParentBlock(context, supabase);
+          const image = await generateImage(prompt, {
+            apiKey: context.openaiApiKey,
+            size,
+            quality,
+          });
+          const block = await storeGeneratedImageBlock({
+            supabase,
+            workspaceId: context.workspaceId,
+            pageId: context.pageId,
+            parentBlockId: context.parentBlockId,
+            prompt,
+            revisedPrompt: image.revisedPrompt,
+            imageBuffer: image.imageBuffer,
+            mimeType: image.mimeType,
+            size,
+            quality,
+            caption,
+            outputMode: context.outputMode,
+            existingBlockId: nextExistingBlockId("image"),
+          });
+
+          context.onBlockCreated?.(block);
+
+          return {
+            success: true,
+            blockId: block.id,
+            type: block.type,
+            revisedPrompt: image.revisedPrompt,
+            message: "Image block created.",
+          };
+        } catch (error) {
+          return {
+            success: false,
+            error: error instanceof Error ? error.message : "Image generation failed.",
+          };
+        }
+      },
     }),
 
     run_command: tool({
@@ -302,7 +511,10 @@ export function createNotebookTools(context: NotebookToolsContext): ToolSet {
       }),
       execute: async ({ query }) => {
         context.onToolUsed?.("web_search");
-        return webSearch(query, { maxResults: 5 });
+        return webSearch(query, {
+          maxResults: 5,
+          apiKey: context.tavilyApiKey,
+        });
       },
     }),
 
@@ -312,14 +524,84 @@ export function createNotebookTools(context: NotebookToolsContext): ToolSet {
         url: z.string().url().describe("URL to scrape"),
       }),
       execute: async ({ url }) => {
+        if (isPdfUrl(url)) {
+          const pdf = await fetchRemotePDF(url);
+          const block = await insertBlock(context, "web_scrape", "source_card", {
+            url,
+            title: pdf.filename,
+            summary: createSourceSummary(pdf.text),
+            full_content: pdf.text,
+            source_type: "pdf",
+            page_count: pdf.pageCount,
+            scraped_at: new Date().toISOString(),
+          }, nextExistingBlockId("source_card"));
+          await embedContent({
+            workspaceId: context.workspaceId,
+            sourceType: "block",
+            sourceId: block.blockId,
+            content: pdf.text,
+          });
+          return {
+            title: pdf.filename,
+            contentLength: pdf.text.length,
+            pageCount: pdf.pageCount,
+            type: "pdf",
+          };
+        }
+
         const result = await webScrape(url);
-        await insertBlock(context, "web_scrape", "source_card", {
+        const block = await insertBlock(context, "web_scrape", "source_card", {
           url: result.url,
           title: result.title,
-          summary: result.content.slice(0, 1200),
+          summary: createSourceSummary(result.content),
+          full_content: result.content,
+          source_type: "web",
           scraped_at: result.scrapedAt,
-        }, nextExistingBlockId());
+        }, nextExistingBlockId("source_card"));
+        await embedContent({
+          workspaceId: context.workspaceId,
+          sourceType: "block",
+          sourceId: block.blockId,
+          content: result.content,
+        });
         return result;
+      },
+    }),
+
+    youtube_transcript: tool({
+      description: "Extract the transcript from a YouTube video URL. Creates a source card block with video metadata and a text block with the full timestamped transcript.",
+      inputSchema: z.object({
+        url: z.string().url().describe("YouTube video URL"),
+      }),
+      execute: async ({ url }) => {
+        const transcript = await extractYouTubeTranscript(url);
+        await insertBlock(context, "youtube_transcript", "source_card", {
+          url,
+          title: transcript.title,
+          summary: transcript.transcript.slice(0, 500),
+          full_content: transcript.transcript,
+          source_type: "youtube",
+          scraped_at: new Date().toISOString(),
+          channel_name: transcript.channelName,
+          duration: transcript.duration,
+          thumbnail_url: transcript.thumbnailUrl,
+        }, nextExistingBlockId("source_card"));
+        const output = await insertBlock(context, "youtube_transcript", "output", {
+          format: "text",
+          data: transcript.transcript,
+        }, nextExistingBlockId("output"));
+        await embedContent({
+          workspaceId: context.workspaceId,
+          sourceType: "block",
+          sourceId: output.blockId,
+          content: transcript.transcript,
+        });
+        return {
+          title: transcript.title,
+          channelName: transcript.channelName,
+          duration: transcript.duration,
+          transcriptLength: transcript.transcript.length,
+        };
       },
     }),
 
@@ -394,6 +676,76 @@ export function createNotebookTools(context: NotebookToolsContext): ToolSet {
   };
 }
 
+export async function createTableBlock(
+  context: NotebookToolsContext,
+  columns: string[],
+  rows: Array<Record<string, string>>
+) {
+  const existingBlockId =
+    getReusableOutputBlockId(context, "table");
+  return insertBlock(
+    context,
+    "create_table",
+    "table",
+    { columns, rows },
+    existingBlockId
+  );
+}
+
+export async function updateTableBlock(
+  context: NotebookToolsContext,
+  blockId: string,
+  columns: string[],
+  rows: Array<Record<string, string>>
+) {
+  return updateBlock(context, "update_table", blockId, "table", { columns, rows });
+}
+
+export async function createJsonBlock(
+  context: NotebookToolsContext,
+  data: Record<string, unknown>,
+  label?: string
+) {
+  const existingBlockId =
+    getReusableOutputBlockId(context, "json");
+  return insertBlock(
+    context,
+    "create_json",
+    "json",
+    { data, ...(label ? { label } : {}) },
+    existingBlockId
+  );
+}
+
+export async function updateJsonBlock(
+  context: NotebookToolsContext,
+  blockId: string,
+  data: Record<string, unknown>,
+  label?: string
+) {
+  return updateBlock(context, "update_json", blockId, "json", {
+    data,
+    ...(label ? { label } : {}),
+  });
+}
+
+export async function createTodoBlock(
+  context: NotebookToolsContext,
+  items: Array<{ text: string; done: boolean }>
+) {
+  const existingBlockId =
+    getReusableOutputBlockId(context, "todo");
+  return insertBlock(context, "create_todo", "todo", { items }, existingBlockId);
+}
+
+export async function updateTodoBlock(
+  context: NotebookToolsContext,
+  blockId: string,
+  items: Array<{ text: string; done: boolean }>
+) {
+  return updateBlock(context, "update_todo", blockId, "todo", { items });
+}
+
 export async function readInputValues(
   supabase: SupabaseClient,
   workspaceId: string,
@@ -439,6 +791,11 @@ const sourceRefSchema = z.discriminatedUnion("type", [
   z.object({ type: z.literal("file"), fileId: z.string().uuid() }),
   z.object({ type: z.literal("url"), url: z.string().url() }),
   z.object({ type: z.literal("paste"), content: z.string() }),
+  z.object({
+    type: z.literal("image"),
+    storageUrl: z.string().url(),
+    mimeType: z.string(),
+  }),
   z.object({
     type: z.literal("rag"),
     query: z.string().min(1),
@@ -506,7 +863,7 @@ async function runCallableCommand(
       {
         workspaceId: context.workspaceId,
         pageId: context.pageId,
-        triggerBlockId: context.parentBlockId,
+        triggerBlockId: context.parentBlockId ?? null,
         commandId: command.id,
         parentRunId: context.currentRunId,
         type: "command",
@@ -522,6 +879,7 @@ async function runCallableCommand(
       createNotebookTools({
         ...context,
         currentRunId: run.id,
+        existingOutputBlocks: undefined,
         existingOutputBlockIds: undefined,
         onBlockCreated: (block) => {
           outputBlockIds.push(block.id);

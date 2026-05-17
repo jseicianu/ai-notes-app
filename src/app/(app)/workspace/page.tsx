@@ -6,7 +6,9 @@ import { AppShell } from "@/components/layout/app-shell";
 import { BlockList } from "@/components/blocks/block-list";
 import { PageHeader } from "@/components/blocks/page-header";
 import { MakeReusableDrawer } from "@/components/blocks/make-reusable-drawer";
+import { ScheduleModal } from "@/components/schedules/schedule-modal";
 import type { Command, Notebook, Page, Block } from "@/lib/models/types";
+import type { SourceReference } from "@/services/source-service";
 
 export default function WorkspacePage() {
   const [workspaceName, setWorkspaceName] = useState("My Workspace");
@@ -95,7 +97,9 @@ export default function WorkspacePage() {
         setPages(pagesByNotebook);
 
         if (pagesData && pagesData.length > 0) {
-          setActivePage(pagesData[0]);
+          const lastPageId = localStorage.getItem("cellnotes_active_page");
+          const restored = lastPageId ? pagesData.find((p) => p.id === lastPageId) : null;
+          setActivePage(restored || pagesData[0]);
         }
       }
 
@@ -167,6 +171,9 @@ export default function WorkspacePage() {
       const page = notebookPages.find((p) => p.id === pageId);
       if (page) {
         setActivePage(page);
+        setRunAllTrigger(0);
+        setRunAllState(null);
+        localStorage.setItem("cellnotes_active_page", pageId);
         return;
       }
     }
@@ -222,11 +229,14 @@ export default function WorkspacePage() {
   };
 
   const [blockRefreshTrigger, setBlockRefreshTrigger] = useState(0);
+  const [sourceRefreshTrigger, setSourceRefreshTrigger] = useState(0);
+
+  const [scrollToBlockId, setScrollToBlockId] = useState<string | null>(null);
 
   const handleInsertCommand = async (command: Command) => {
     if (!activePage || !workspaceId) return;
 
-    const { error } = await supabase
+    const { data, error } = await supabase
       .from("blocks")
       .insert({
         page_id: activePage.id,
@@ -239,9 +249,12 @@ export default function WorkspacePage() {
           inputs: {},
         },
         sort_order: activePageBlocks.length,
-      });
+      })
+      .select("id")
+      .single();
 
-    if (!error) {
+    if (!error && data) {
+      setScrollToBlockId(data.id);
       setBlockRefreshTrigger((n) => n + 1);
     }
   };
@@ -326,9 +339,19 @@ export default function WorkspacePage() {
   };
 
   const [editingCommand, setEditingCommand] = useState<Command | null>(null);
+  const [scheduleTarget, setScheduleTarget] = useState<{
+    commandId: string;
+    commandName: string;
+    commandSlug: string;
+    commandDescription: string | null;
+    inputValues?: Record<string, unknown>;
+    sourceRefs?: SourceReference[];
+  } | null>(null);
   const [addBlockTrigger, setAddBlockTrigger] = useState(0);
   const [runAllTrigger, setRunAllTrigger] = useState(0);
+  const [runAllState, setRunAllState] = useState<import("@/components/blocks/block-list").RunAllState | null>(null);
   const openRuntimeRef = useRef<(() => void) | null>(null);
+  const activeRunChangeRef = useRef<((runId: string | null) => void) | null>(null);
 
   if (loading) {
     return (
@@ -356,6 +379,12 @@ export default function WorkspacePage() {
       userEmail={userEmail}
       userAvatarUrl={userAvatarUrl}
       openRuntimeRef={openRuntimeRef}
+      activeRunChangeRef={activeRunChangeRef}
+      onQuickCreatePage={() => {
+        const firstNotebook = notebooks[0];
+        if (firstNotebook) handleCreatePage(firstNotebook.id);
+      }}
+      onRunAll={() => setRunAllTrigger((n) => n + 1)}
     >
       {activePage && workspaceId && (
         <>
@@ -369,22 +398,45 @@ export default function WorkspacePage() {
             onCreateNotebook={handleCreateNotebook}
             onAddBlock={() => setAddBlockTrigger((n) => n + 1)}
             onRunAll={() => setRunAllTrigger((n) => n + 1)}
+            runAllState={runAllState}
             onStarToggle={handlePageStarToggle}
             onDuplicatePage={handleDuplicatePage}
             onArchivePage={handleArchivePage}
             onDeletePage={handleDeletePage}
+            sourceRefreshTrigger={sourceRefreshTrigger}
           />
           <BlockList
             key={activePage.id}
             pageId={activePage.id}
             workspaceId={workspaceId}
             initialBlocks={activePageBlocks}
-            onBlocksChange={setActivePageBlocks}
+            onBlocksChange={(blocks) => {
+              setActivePageBlocks((prev) => {
+                if (blocks.length !== prev.length) {
+                  setSourceRefreshTrigger((n) => n + 1);
+                }
+                return blocks;
+              });
+            }}
             refreshTrigger={blockRefreshTrigger}
             addBlockTrigger={addBlockTrigger}
             runAllTrigger={runAllTrigger}
+            scrollToBlockId={scrollToBlockId}
+            onScrollToBlockDone={() => setScrollToBlockId(null)}
             onViewRun={() => openRuntimeRef.current?.()}
+            onActiveRunChange={(runId) => activeRunChangeRef.current?.(runId)}
             onEditCommand={setEditingCommand}
+            onScheduleCommand={(cmdId, cmdName, cmdSlug, cmdDesc, runConfig) =>
+              setScheduleTarget({
+                commandId: cmdId,
+                commandName: cmdName,
+                commandSlug: cmdSlug,
+                commandDescription: cmdDesc,
+                inputValues: runConfig?.inputValues,
+                sourceRefs: runConfig?.sourceRefs,
+              })
+            }
+            onRunAllStateChange={setRunAllState}
           />
         </>
       )}
@@ -396,6 +448,23 @@ export default function WorkspacePage() {
         prompt={editingCommand.prompt_template}
         block={{ workspace_id: workspaceId, page_id: activePage?.id || "", id: "" } as Block}
         editCommand={editingCommand}
+      />
+    )}
+    {workspaceId && (
+      <ScheduleModal
+        open={!!scheduleTarget}
+        onClose={() => setScheduleTarget(null)}
+        workspaceId={workspaceId}
+        commandId={scheduleTarget?.commandId}
+        commandName={scheduleTarget?.commandName}
+        commandSlug={scheduleTarget?.commandSlug}
+        commandDescription={scheduleTarget?.commandDescription}
+        inputValues={scheduleTarget?.inputValues}
+        sourceRefs={scheduleTarget?.sourceRefs}
+        pages={Object.values(pages).flat()}
+        notebooks={notebooks}
+        currentPageId={activePage?.id}
+        onCreated={() => setScheduleTarget(null)}
       />
     )}
     </>

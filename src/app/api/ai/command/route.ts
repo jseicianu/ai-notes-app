@@ -9,9 +9,9 @@ import {
 import { NextResponse, type NextRequest } from "next/server";
 import { z } from "zod";
 import type { Block, Command, Run } from "@/lib/models/types";
-import { getSourceConfig, isSourceInput } from "@/lib/models/types";
+import { BlockType, getSourceConfig, isSourceInput } from "@/lib/models/types";
 import { createClient } from "@/lib/supabase/server";
-import { fillTemplate, validateOutput } from "@/services/command-service";
+import { fillTemplate, validateInputs, validateOutput } from "@/services/command-service";
 import { getModel, type ModelOptions } from "@/services/model-service";
 import {
   createNotebookTools,
@@ -25,12 +25,22 @@ import {
   type ResolvedSource,
   type SourceReference,
 } from "@/services/source-service";
+import { ensureTextOutputBlock } from "@/services/text-output-block-service";
 
 export const runtime = "nodejs";
 
 const requestSchema = z.object({
   commandId: z.string().uuid(),
   inputs: z.record(z.string(), z.string()).default({}),
+  existingOutputBlocks: z
+    .array(
+      z.object({
+        id: z.string().uuid(),
+        type: z.string(),
+      })
+    )
+    .default([]),
+  /** @deprecated Use existingOutputBlocks so reuse can be scoped by block type. */
   existingOutputBlockIds: z.array(z.string().uuid()).default([]),
   sources: z
     .array(
@@ -44,15 +54,23 @@ const requestSchema = z.object({
           query: z.string().min(1),
           limit: z.number().int().positive().optional(),
         }),
+        z.object({
+          type: z.literal("image"),
+          storageUrl: z.string().url(),
+          mimeType: z.string(),
+        }),
       ])
     )
     .default([]),
+  agentMode: z.boolean().default(false),
+  outputMode: z.enum(["replace", "append", "version"]).default("replace"),
   workspaceId: z.string().uuid(),
   pageId: z.string().uuid(),
   triggerBlockId: z.string().uuid(),
 });
 
 type CommandRequest = z.infer<typeof requestSchema>;
+type ExistingOutputBlockRef = { id: string; type: BlockType };
 
 export async function POST(request: NextRequest) {
   const startedAt = Date.now();
@@ -91,6 +109,14 @@ export async function POST(request: NextRequest) {
 
   if (!command) {
     return NextResponse.json({ error: "Command not found" }, { status: 404 });
+  }
+
+  const validationErrors = validateInputs(command.inputs, body.inputs);
+  if (validationErrors.length > 0) {
+    return NextResponse.json(
+      { error: "Validation failed", details: validationErrors },
+      { status: 400 }
+    );
   }
 
   const sourceConfig = getSourceConfig(command);
@@ -163,6 +189,12 @@ export async function POST(request: NextRequest) {
   const modelName = command.model_name || workspace.modelName || "";
   const outputBlockIds: string[] = [];
   const toolsUsed = new Set<string>();
+  const steps: Array<Record<string, unknown>> = [];
+  let cumulativeTokens = 0;
+  const existingOutputBlocks =
+    body.outputMode === "append"
+      ? []
+      : await resolveExistingOutputBlocks(serviceClient, body);
 
   let run: Run | undefined;
 
@@ -179,7 +211,9 @@ export async function POST(request: NextRequest) {
           inputVariables,
           sources: body.sources,
           resolvedSources: summarizeResolvedSources(resolvedSources),
-          existingOutputBlockIds: body.existingOutputBlockIds,
+          existingOutputBlocks,
+          agentMode: body.agentMode,
+          outputMode: body.outputMode,
           prompt,
           contextConfig: command.context_config,
         },
@@ -196,34 +230,64 @@ export async function POST(request: NextRequest) {
       runId: run.id,
       outputBlockIds,
       toolsUsed,
-      existingOutputBlockIds: body.existingOutputBlockIds,
+      existingOutputBlocks,
       serviceClient,
+      tavilyApiKey: workspace.tavilyApiKey,
+      openaiApiKey: workspace.modelOptions.apiKeys?.openai,
     });
+
+    const commandPrompt = buildCommandPrompt(
+      prompt,
+      inputContext,
+      formatResolvedSources(resolvedSources),
+      context.text
+    );
+    const imageSources = resolvedSources.filter((source) => source.type === "image");
+    const messages = buildMessages(commandPrompt, imageSources);
 
     const result = streamText({
       model: getModel(modelProvider, modelName, workspace.modelOptions),
-      system: buildSystemPrompt(command),
-      prompt: buildCommandPrompt(
-        prompt,
-        inputContext,
-        formatResolvedSources(resolvedSources),
-        context.text
-      ),
+      system: buildSystemPrompt(command, body),
+      ...(messages ? { messages } : { prompt: commandPrompt }),
       tools,
-      stopWhen: stepCountIs(5),
+      stopWhen: stepCountIs(body.agentMode ? 25 : 5),
+      onStepFinish: (event) => {
+        cumulativeTokens += event.usage?.totalTokens ?? 0;
+        steps.push({
+          stepNumber: event.stepNumber,
+          toolCalls:
+            event.toolCalls?.map((call) => ({
+              name: call.toolName,
+              args: call.input,
+            })) ?? [],
+          finishReason: event.finishReason,
+          tokenUsage: event.usage
+            ? {
+                prompt: event.usage.inputTokens ?? 0,
+                completion: event.usage.outputTokens ?? 0,
+                total: event.usage.totalTokens ?? 0,
+              }
+            : null,
+          warning:
+            cumulativeTokens > 100000
+              ? "Cumulative token guardrail exceeded"
+              : undefined,
+        });
+      },
       onFinish: async (event) => {
         const firstOutput = parseStructuredOutput(event.text);
         let validation = validateOutput(firstOutput, command.output_schema);
         let finalText = event.text;
         let finalOutput = firstOutput;
         let repairUsed = false;
+        const requestedOutput = getRequestedOutputInput(body.inputs);
+        const hasNotebookOutput = outputBlockIds.length > 0 || toolsUsed.size > 0;
 
-        if (!validation.valid) {
+        if (!validation.valid && !hasNotebookOutput && !requestedOutput) {
           const repair = await generateText({
             model: getModel(modelProvider, modelName, workspace.modelOptions),
             system: buildRepairSystemPrompt(command),
             prompt: buildRepairPrompt(event.text, validation.errors ?? []),
-            tools,
             stopWhen: stepCountIs(3),
           });
 
@@ -231,6 +295,20 @@ export async function POST(request: NextRequest) {
           finalText = repair.text;
           finalOutput = parseStructuredOutput(repair.text);
           validation = validateOutput(finalOutput, command.output_schema);
+        }
+
+        const textOutputBlockId = await ensureTextOutputBlock({
+          supabase: serviceClient,
+          workspaceId: body.workspaceId,
+          pageId: body.pageId,
+          parentBlockId: body.triggerBlockId,
+          text: event.text,
+          outputMode: body.outputMode,
+          existingOutputBlocks,
+          outputBlockIds,
+        });
+        if (textOutputBlockId && !outputBlockIds.includes(textOutputBlockId)) {
+          outputBlockIds.unshift(textOutputBlockId);
         }
 
         await updateRunStatus(
@@ -242,6 +320,7 @@ export async function POST(request: NextRequest) {
               structuredOutput: finalOutput,
               repairUsed,
               validation,
+              steps,
             },
             outputBlockIds,
             contextUsed,
@@ -250,6 +329,8 @@ export async function POST(request: NextRequest) {
               ? repairUsed
                 ? "passed_after_repair"
                 : "passed"
+              : hasNotebookOutput
+                ? "skipped_tool_output"
               : "failed",
             tokenUsage: normalizeUsage(event.totalUsage),
             durationMs: Date.now() - startedAt,
@@ -310,8 +391,10 @@ function buildAllowedTools(params: {
   runId: string;
   outputBlockIds: string[];
   toolsUsed: Set<string>;
-  existingOutputBlockIds: string[];
+  existingOutputBlocks: ExistingOutputBlockRef[];
   serviceClient: ReturnType<typeof createServiceRoleClient>;
+  tavilyApiKey?: string;
+  openaiApiKey?: string;
 }): ToolSet {
   return filterNotebookTools(
     createNotebookTools({
@@ -319,13 +402,103 @@ function buildAllowedTools(params: {
       pageId: params.body.pageId,
       parentBlockId: params.body.triggerBlockId,
       currentRunId: params.runId,
-      existingOutputBlockIds: params.existingOutputBlockIds,
+      existingOutputBlocks:
+        params.body.outputMode === "append" ? [] : params.existingOutputBlocks,
       supabase: params.serviceClient,
+      tavilyApiKey: params.tavilyApiKey,
+      openaiApiKey: params.openaiApiKey,
+      outputMode: params.body.outputMode,
       onBlockCreated: (block) => params.outputBlockIds.push(block.id),
       onToolUsed: (toolName) => params.toolsUsed.add(toolName),
     }),
-    params.command.allowed_tools
+    constrainCreateToolsForRequestedOutput(
+      params.command.allowed_tools,
+      params.body.inputs
+    )
   );
+}
+
+const CREATE_OUTPUT_TOOL_NAMES = new Set([
+  "create_text_output",
+  "create_table",
+  "create_json",
+  "create_todo",
+  "create_bulleted_list",
+  "create_numbered_list",
+  "create_callout",
+  "create_source_card",
+  "create_code_output",
+  "generate_image",
+]);
+
+function constrainCreateToolsForRequestedOutput(
+  allowedTools: string[],
+  inputs: Record<string, string>
+) {
+  const requested = getRequestedOutputInput(inputs);
+  const requestedCreateTools = getCreateToolsForRequestedOutput(requested);
+  if (!requestedCreateTools) return allowedTools;
+
+  return allowedTools.filter(
+    (toolName) =>
+      !CREATE_OUTPUT_TOOL_NAMES.has(toolName) ||
+      requestedCreateTools.has(toolName)
+  );
+}
+
+function getRequestedOutputInput(inputs: Record<string, string>) {
+  return String(
+    inputs.output ??
+      inputs.output_type ??
+      inputs.outputType ??
+      inputs.format ??
+      ""
+  ).trim();
+}
+
+function getCreateToolsForRequestedOutput(requestedOutput: string) {
+  const normalized = requestedOutput.toLowerCase();
+  if (!normalized) return null;
+
+  const tools = new Set(["create_text_output"]);
+  if (/\b(table|spreadsheet|grid)\b/.test(normalized)) {
+    tools.add("create_table");
+    return tools;
+  }
+  if (/\b(to-?do|todo|checklist|task list|action items?)\b/.test(normalized)) {
+    tools.add("create_todo");
+    return tools;
+  }
+  if (/\b(json|object|structured data)\b/.test(normalized)) {
+    tools.add("create_json");
+    return tools;
+  }
+  if (/\b(bullets?|bullet list)\b/.test(normalized)) {
+    tools.add("create_bulleted_list");
+    return tools;
+  }
+  if (/\b(numbered|ordered list)\b/.test(normalized)) {
+    tools.add("create_numbered_list");
+    return tools;
+  }
+  if (/\b(callout|note|warning|info)\b/.test(normalized)) {
+    tools.add("create_callout");
+    return tools;
+  }
+  if (/\b(source card|source)\b/.test(normalized)) {
+    tools.add("create_source_card");
+    return tools;
+  }
+  if (/\b(code|script|snippet|function|program)\b/.test(normalized)) {
+    tools.add("create_code_output");
+    return tools;
+  }
+  if (/\b(image|picture|illustration|diagram|logo|photo|graphic|visual|drawing|artwork)\b/.test(normalized)) {
+    tools.add("generate_image");
+    return tools;
+  }
+
+  return null;
 }
 
 function createServiceRoleClient() {
@@ -344,6 +517,58 @@ function createServiceRoleClient() {
       },
     }
   );
+}
+
+async function resolveExistingOutputBlocks(
+  serviceClient: ReturnType<typeof createServiceRoleClient>,
+  body: CommandRequest
+): Promise<ExistingOutputBlockRef[]> {
+  if (body.existingOutputBlocks.length > 0) {
+    return body.existingOutputBlocks.flatMap((block) => {
+      const parsedType = BlockType.safeParse(block.type);
+      return parsedType.success ? [{ id: block.id, type: parsedType.data }] : [];
+    });
+  }
+
+  if (body.existingOutputBlockIds.length === 0) {
+    const { data, error } = await serviceClient
+      .from("blocks")
+      .select("id,type")
+      .eq("workspace_id", body.workspaceId)
+      .eq("page_id", body.pageId)
+      .eq("parent_block_id", body.triggerBlockId)
+      .order("sort_order", { ascending: true });
+
+    if (error) throw new Error(error.message);
+
+    return ((data ?? []) as Array<{ id: string; type: string }>).flatMap((block) => {
+      const parsedType = BlockType.safeParse(block.type);
+      return parsedType.success ? [{ id: block.id, type: parsedType.data }] : [];
+    });
+  }
+
+  const { data, error } = await serviceClient
+    .from("blocks")
+    .select("id,type")
+    .eq("workspace_id", body.workspaceId)
+    .eq("page_id", body.pageId)
+    .eq("parent_block_id", body.triggerBlockId)
+    .in("id", body.existingOutputBlockIds);
+
+  if (error) throw new Error(error.message);
+
+  const blocksById = new Map(
+    ((data ?? []) as Array<{ id: string; type: string }>).map((block) => [
+      block.id,
+      block.type,
+    ])
+  );
+
+  return body.existingOutputBlockIds.flatMap((id) => {
+    const type = blocksById.get(id);
+    const parsedType = BlockType.safeParse(type);
+    return parsedType.success ? [{ id, type: parsedType.data }] : [];
+  });
 }
 
 async function getAuthenticatedUser(request: NextRequest) {
@@ -413,6 +638,9 @@ async function getWorkspaceForUser(
         google: stringSetting(apiKeys, "google"),
       },
     } satisfies ModelOptions,
+    tavilyApiKey:
+      stringSetting(settings, "tavily_api_key", "tavilyApiKey") ||
+      stringSetting(apiKeys, "tavily", "tavily_api_key", "tavilyApiKey"),
   };
 }
 
@@ -501,6 +729,23 @@ function buildCommandPrompt(
     .join("\n\n");
 }
 
+function buildMessages(prompt: string, imageSources: ResolvedSource[]) {
+  if (imageSources.length === 0) return null;
+
+  return [
+    {
+      role: "user",
+      content: [
+        { type: "text" as const, text: prompt },
+        ...imageSources.map((source) => ({
+          type: "image" as const,
+          image: source.metadata?.url ?? "",
+        })),
+      ],
+    },
+  ] as Parameters<typeof streamText>[0]["messages"];
+}
+
 function formatResolvedSources(resolvedSources: ResolvedSource[]) {
   return resolvedSources
     .map(
@@ -523,20 +768,27 @@ function summarizeResolvedSources(resolvedSources: ResolvedSource[]) {
   }));
 }
 
-function buildSystemPrompt(command: Command) {
+function buildSystemPrompt(command: Command, body: CommandRequest) {
+  const requestedOutput = getRequestedOutputInput(body.inputs);
   return [
     "You are running a saved command inside a command notebook.",
     "",
     "Rules:",
     "- Follow the command template precisely. Input variables are hard constraints, not suggestions.",
+    requestedOutput
+      ? `- The requested output format is "${requestedOutput}". This overrides stale descriptions, schemas, and previous runs. Do not create other output block types.`
+      : null,
     "- If an input specifies a count (e.g. \"three\", \"5\"), produce exactly that many items — no more, no fewer.",
     "- Create at most ONE block per output type. If the command needs a table, call create_table once with the complete, consolidated table.",
+    "- If the command asks for an image, picture, logo, illustration, or other visual output, use generate_image. Do not say you cannot create images unless that tool returns an error.",
     "- Do not create duplicate blocks with the same structure.",
-    "- Keep your text response concise. Do not repeat information that is already in a created block.",
+    "- Do not use markdown tables in streamed text responses. If information needs rows and columns, use create_table when table output is requested. For tiny examples or comparisons, use short bullets or inline pairs like \"1 -> A, 13 -> M\".",
+    "- Be concise. Keep your text response short — a few sentences max. Do not repeat information that is already in a created block.",
     "- Use only the tools made available for this command.",
+    "- When using web_scrape, the source card has the full content. Only write a brief 2-3 sentence summary in your text response.",
     "",
-    `Output schema:\n${safeStringify(command.output_schema)}`,
-  ].join("\n");
+    requestedOutput ? null : `Output schema:\n${safeStringify(command.output_schema)}`,
+  ].filter(Boolean).join("\n");
 }
 
 function buildRepairSystemPrompt(command: Command) {
@@ -547,13 +799,18 @@ function buildRepairSystemPrompt(command: Command) {
   ].join("\n");
 }
 
-function buildRepairPrompt(previousOutput: string, errors: string[]) {
+function buildRepairPrompt(
+  previousOutput: string,
+  errors: Array<{ path: string; message: string; expected: string; actual: string }>
+) {
   return [
     "Previous output:",
     previousOutput,
     "",
     "Validation errors:",
-    errors.join("\n"),
+    errors
+      .map((error) => `${error.path}: ${error.message} (expected ${error.expected}, got ${error.actual})`)
+      .join("\n"),
   ].join("\n");
 }
 
@@ -700,6 +957,8 @@ function extractBlockText(block: Block): string {
     }
     case "source_card":
       return `${c.title ?? ""}\n${c.summary ?? ""}\nURL: ${c.url ?? ""}`;
+    case "code":
+      return `\`\`\`${(c.language as string) || "plain"}\n${(c.code as string) || ""}\n\`\`\``;
     default:
       return safeStringify(c);
   }

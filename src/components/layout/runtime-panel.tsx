@@ -50,6 +50,7 @@ const TOOL_ICONS: Record<string, React.ReactNode> = {
   web_search: <Globe className="h-3.5 w-3.5 text-green-500" />,
   web_scrape: <Globe className="h-3.5 w-3.5 text-green-500" />,
   run_command: <Terminal className="h-3.5 w-3.5 text-orange-500" />,
+  youtube_transcript: <Globe className="h-3.5 w-3.5 text-green-500" />,
 };
 
 function ProviderIcon({ provider }: { provider: string }) {
@@ -74,6 +75,7 @@ interface RuntimePanelProps {
   onTabChange: (tab: Tab) => void;
   workspaceId?: string;
   pageId?: string;
+  activeRunId?: string | null;
 }
 
 const tabs: { id: Tab; label: string; icon: React.ReactNode }[] = [
@@ -98,6 +100,7 @@ const TOOL_INFO: Record<string, { label: string; description: string }> = {
   web_search: { label: "Searching the web", description: "Queried web search API." },
   web_scrape: { label: "Scraping website", description: "Extracted content from URL." },
   run_command: { label: "Running command", description: "Executed saved command internally." },
+  youtube_transcript: { label: "Extracting YouTube transcript", description: "Fetched video transcript." },
 };
 
 function formatDuration(ms: number): string {
@@ -212,13 +215,13 @@ function TimelineStep({
       </div>
 
       {/* Content */}
-      <div className="flex-1 min-w-0 pb-4">
+      <div className={`flex-1 min-w-0 ${isLast ? "pb-2" : "pb-6"}`}>
         <span className="text-[12px] font-medium text-gray-800">{label}</span>
         {description && (
-          <p className="text-[11px] text-gray-500 mt-0.5">{description}</p>
+          <p className="text-[11px] text-gray-500 mt-1 break-words">{description}</p>
         )}
         {badge && (
-          <span className={`inline-block text-[10px] font-medium px-2 py-0.5 rounded border mt-1.5 ${badgeStyles[badgeColor]}`}>
+          <span className={`inline-block text-[10px] font-medium px-2.5 py-1 rounded-full border ${description ? "mt-2" : "mt-1.5"} ${badgeStyles[badgeColor]}`}>
             {badge}
           </span>
         )}
@@ -257,17 +260,39 @@ function RunDetail({ run }: { run: Run }) {
     });
   }
 
-  // Tool steps
-  for (const tool of toolsUsed) {
-    const info = TOOL_INFO[tool] || { label: tool, description: "" };
-    const isCreate = tool.startsWith("create_");
-    steps.push({
-      time: formatTime(baseTime),
-      icon: <BlueCheck />,
-      label: info.label,
-      description: info.description,
-      badge: isCreate ? tool.replace("create_", "").replace(/_/g, " ") : undefined,
-    });
+  // Rich steps from output.steps (agent mode / step streaming)
+  const outputSteps = (run.output as Record<string, unknown>)?.steps as Array<Record<string, unknown>> | undefined;
+  if (outputSteps?.length) {
+    for (const os of outputSteps) {
+      const calls = os.toolCalls as Array<{ name: string; args?: unknown }> | undefined;
+      const toolName = calls?.[0]?.name;
+      const info = toolName ? (TOOL_INFO[toolName] || { label: toolName, description: "" }) : { label: "Processing", description: "" };
+      const argsPreview = calls?.[0]?.args ? JSON.stringify(calls[0].args).slice(0, 60) : undefined;
+      const usage = os.tokenUsage as { total?: number } | null;
+      const toolIcon = toolName && TOOL_ICONS[toolName]
+        ? <div className="h-5 w-5 rounded-full bg-blue-50 flex items-center justify-center shrink-0">{TOOL_ICONS[toolName]}</div>
+        : <BlueCheck />;
+      steps.push({
+        time: formatTime(baseTime),
+        icon: toolIcon,
+        label: info.label,
+        description: argsPreview ? argsPreview : info.description,
+        badge: usage?.total ? `${usage.total} tokens` : undefined,
+      });
+    }
+  } else {
+    // Fallback: reconstruct from tools_used array
+    for (const tool of toolsUsed) {
+      const info = TOOL_INFO[tool] || { label: tool, description: "" };
+      const isCreate = tool.startsWith("create_");
+      steps.push({
+        time: formatTime(baseTime),
+        icon: <BlueCheck />,
+        label: info.label,
+        description: info.description,
+        badge: isCreate ? tool.replace("create_", "").replace(/_/g, " ") : undefined,
+      });
+    }
   }
 
   // Schema step
@@ -307,7 +332,7 @@ function RunDetail({ run }: { run: Run }) {
   return (
     <div>
       {/* Timeline */}
-      <div className="px-3 pt-4 pb-2">
+      <div className="px-3 pt-4 pb-4">
         {steps.map((step, i) => (
           <TimelineStep
             key={i}
@@ -370,7 +395,7 @@ function RunDetail({ run }: { run: Run }) {
 
 /* ── Run card (collapsed) ── */
 
-function RunCard({ run, expanded, onToggle }: { run: Run; expanded: boolean; onToggle: () => void }) {
+function RunCard({ run, expanded, onToggle, isLive }: { run: Run; expanded: boolean; onToggle: () => void; isLive?: boolean }) {
   const isCommand = run.type === "command";
 
   return (
@@ -400,7 +425,15 @@ function RunCard({ run, expanded, onToggle }: { run: Run; expanded: boolean; onT
             {run.duration_ms ? ` · ${formatDuration(run.duration_ms)}` : ""}
           </span>
         </div>
-        <StatusBadge status={run.status} />
+        <div className="flex items-center gap-1.5">
+          {isLive && (
+            <span className="flex items-center gap-1 text-[10px] font-medium text-green-600 bg-green-50 border border-green-200 px-1.5 py-0.5 rounded-full">
+              <span className="h-1.5 w-1.5 rounded-full bg-green-500 animate-pulse" />
+              Live
+            </span>
+          )}
+          <StatusBadge status={run.status} />
+        </div>
       </button>
 
       {expanded && (
@@ -716,6 +749,7 @@ export function RuntimePanel({
   onTabChange,
   workspaceId,
   pageId,
+  activeRunId: liveRunId,
 }: RuntimePanelProps) {
   const supabase = useMemo(() => createClient(), []);
   const [runs, setRuns] = useState<Run[]>([]);
@@ -733,13 +767,36 @@ export function RuntimePanel({
       .eq("page_id", pageId)
       .order("created_at", { ascending: false })
       .limit(20);
-    setRuns((data ?? []) as Run[]);
-    setLoading(false);
-    if (data && data.length > 0 && !didAutoExpand.current) {
-      didAutoExpand.current = true;
-      setExpandedRunId(data[0].id);
+
+    const STALE_MS = 5 * 60 * 1000;
+    const now = Date.now();
+    const staleIds: string[] = [];
+    const cleaned = ((data ?? []) as Run[]).map((run) => {
+      if (run.status === "running" && run.id !== liveRunId && run.created_at) {
+        const age = now - new Date(run.created_at).getTime();
+        if (age > STALE_MS) {
+          staleIds.push(run.id);
+          return { ...run, status: "failed" } as Run;
+        }
+      }
+      return run;
+    });
+
+    if (staleIds.length > 0) {
+      supabase
+        .from("runs")
+        .update({ status: "failed", completed_at: new Date().toISOString() })
+        .in("id", staleIds)
+        .then();
     }
-  }, [workspaceId, pageId, supabase]);
+
+    setRuns(cleaned);
+    setLoading(false);
+    if (cleaned.length > 0 && !didAutoExpand.current) {
+      didAutoExpand.current = true;
+      setExpandedRunId(cleaned[0].id);
+    }
+  }, [workspaceId, pageId, supabase, liveRunId]);
 
   useEffect(() => {
     if (!collapsed && workspaceId && pageId) {
@@ -750,9 +807,15 @@ export function RuntimePanel({
 
   useEffect(() => {
     if (collapsed || !workspaceId || !pageId) return;
-    const interval = setInterval(loadRuns, 5000);
+    const pollMs = liveRunId ? 1500 : 5000;
+    const interval = setInterval(loadRuns, pollMs);
     return () => clearInterval(interval);
-  }, [collapsed, workspaceId, pageId, loadRuns]);
+  }, [collapsed, workspaceId, pageId, loadRuns, liveRunId]);
+
+  useEffect(() => {
+    // eslint-disable-next-line react-hooks/set-state-in-effect
+    if (liveRunId) setExpandedRunId(liveRunId);
+  }, [liveRunId]);
 
   const selectedRun = runs.find((r) => r.id === expandedRunId) ?? runs[0] ?? null;
 
@@ -825,6 +888,7 @@ export function RuntimePanel({
                   key={run.id}
                   run={run}
                   expanded={expandedRunId === run.id}
+                  isLive={run.id === liveRunId && run.status === "running"}
                   onToggle={() =>
                     setExpandedRunId(expandedRunId === run.id ? null : run.id)
                   }

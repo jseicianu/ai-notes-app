@@ -18,6 +18,8 @@ export const BlockType = z.enum([
   "input",
   "input_group",
   "error",
+  "code",
+  "image",
 ]);
 export type BlockType = z.infer<typeof BlockType>;
 
@@ -36,6 +38,7 @@ export const RunType = z.enum([
   "web_scrape",
   "rag_search",
   "file_extraction",
+  "test",
 ]);
 export type RunType = z.infer<typeof RunType>;
 
@@ -116,6 +119,8 @@ export interface BlockVersion {
   created_at: string;
 }
 
+export type AiCellContextMode = "selected_sources" | "blocks_above" | "none";
+
 export interface Run {
   id: string;
   workspace_id: string;
@@ -161,6 +166,14 @@ export interface Command {
     max?: number;
     options?: string[];
     input_mode?: "source" | "text";
+    validation?: {
+      min?: number;
+      max?: number;
+      minLength?: number;
+      maxLength?: number;
+      pattern?: string;
+      patternMessage?: string;
+    };
   }>;
   output_schema: Record<string, unknown>;
   allowed_tools: string[];
@@ -203,12 +216,16 @@ export function getSourceConfig(command: Command): SourceConfig | null {
   return raw as SourceConfig;
 }
 
-const SOURCE_NAME_PATTERN = /^(source|text|content|data|input|body|document|article|notes)$/i;
+const SOURCE_TEXT_NAME_PATTERN = /^(source|source_text|source_content|content|body|document|article|notes)$/i;
+const LEGACY_SOURCE_STRING_NAME_PATTERN = /^source(?:_(?:text|content|body|document|article|notes))?$/i;
 
 export function isSourceInput(input: CommandInput): boolean {
   if (input.input_mode === "source") return true;
   if (input.input_mode === "text") return false;
-  return (input.type === "string" || input.type === "text") && SOURCE_NAME_PATTERN.test(input.name);
+  if (input.type === "source") return true;
+  if (input.type === "text") return SOURCE_TEXT_NAME_PATTERN.test(input.name);
+  if (input.type === "string") return LEGACY_SOURCE_STRING_NAME_PATTERN.test(input.name);
+  return false;
 }
 
 export interface CommandVersion {
@@ -220,6 +237,28 @@ export interface CommandVersion {
   output_schema: Record<string, unknown>;
   allowed_tools: string[];
   created_at: string;
+}
+
+export interface Schedule {
+  id: string;
+  workspace_id: string;
+  command_id: string;
+  preset_id: string | null;
+  target_page_id: string | null;
+  input_values: Record<string, unknown>;
+  source_refs: unknown[];
+  output_mode: "append" | "replace" | "version";
+  name: string;
+  cron_expression: string;
+  timezone: string;
+  is_active: boolean;
+  last_run_at: string | null;
+  last_run_status: string | null;
+  last_run_id: string | null;
+  last_error?: Record<string, unknown> | null;
+  next_run_at: string | null;
+  created_at: string;
+  updated_at: string;
 }
 
 export interface SuggestedInput {
@@ -243,4 +282,23 @@ export interface FileRecord {
   extracted_text: string | null;
   metadata: Record<string, unknown>;
   created_at: string;
+}
+
+export interface SearchResult {
+  id: string;
+  content: string;
+  sourceType: "block" | "page" | "file" | "web";
+  sourceId: string;
+  similarity: number;
+  metadata: {
+    breadcrumb: string;
+    pageId?: string;
+    pageTitle?: string;
+    notebookId?: string;
+    notebookName?: string;
+    blockType?: string;
+    filename?: string;
+    url?: string;
+    title?: string;
+  };
 }

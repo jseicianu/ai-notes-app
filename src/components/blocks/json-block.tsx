@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useCallback, useRef, useEffect } from "react";
-import { ChevronRight, ChevronDown, Copy, Check } from "lucide-react";
+import { ChevronRight, ChevronDown, Copy, Check, ChevronsDownUp, ChevronsUpDown } from "lucide-react";
 import { DuotoneIcon } from "@/components/ui/duotone-icon";
 import type { Block } from "@/lib/models/types";
 
@@ -12,22 +12,22 @@ interface JsonBlockProps {
 
 type JsonValue = string | number | boolean | null | JsonValue[] | { [key: string]: JsonValue };
 
-// --- Tree View ---
-
 function JsonNode({
   keyName,
   value,
   depth,
   isLast,
   defaultExpanded,
+  globalExpanded,
 }: {
   keyName?: string;
   value: JsonValue;
   depth: number;
   isLast: boolean;
   defaultExpanded: boolean;
+  globalExpanded: boolean | null;
 }) {
-  const [expanded, setExpanded] = useState(defaultExpanded);
+  const [expanded, setExpanded] = useState(globalExpanded ?? defaultExpanded);
 
   const isObject = value !== null && typeof value === "object" && !Array.isArray(value);
   const isArray = Array.isArray(value);
@@ -110,6 +110,7 @@ function JsonNode({
           depth={depth + 1}
           isLast={i === entries.length - 1}
           defaultExpanded={depth < 1}
+          globalExpanded={globalExpanded}
         />
       ))}
       <div className="flex items-baseline" style={{ paddingLeft: depth * 20 }}>
@@ -151,10 +152,11 @@ export function JsonBlock({ block, onUpdate }: JsonBlockProps) {
   const [parsedData, setParsedData] = useState<JsonValue>(data);
   const [parseError, setParseError] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
+  const [treeVersion, setTreeVersion] = useState(0);
+  const [globalExpanded, setGlobalExpanded] = useState<boolean | null>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const updateTimeout = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
 
-  // Live-parse as user types
   const handleChange = useCallback(
     (text: string) => {
       setRawText(text);
@@ -179,7 +181,6 @@ export function JsonBlock({ block, onUpdate }: JsonBlockProps) {
     setTimeout(() => setCopied(false), 1500);
   }, [parsedData]);
 
-  // Auto-resize textarea
   useEffect(() => {
     if (textareaRef.current) {
       const ta = textareaRef.current;
@@ -189,10 +190,19 @@ export function JsonBlock({ block, onUpdate }: JsonBlockProps) {
   }, [rawText]);
 
   const hasOutput = parsedData !== undefined && parsedData !== null;
+  const handleExpandAll = () => {
+    setGlobalExpanded(true);
+    setTreeVersion((version) => version + 1);
+  };
+
+  const handleCollapseAll = () => {
+    setGlobalExpanded(false);
+    setTreeVersion((version) => version + 1);
+  };
 
   return (
     <div>
-      {/* Input — raw editor, stretches when block is resized */}
+      {/* Input — raw editor */}
       <div
         className="px-4 py-3 cursor-text flex-1 min-h-0 flex flex-col"
         style={{ backgroundColor: "#f0f4f8" }}
@@ -219,10 +229,12 @@ export function JsonBlock({ block, onUpdate }: JsonBlockProps) {
         ) : hasOutput ? (
           <div className="px-4 py-3 text-[13px] font-mono leading-relaxed overflow-x-auto select-text">
             <JsonNode
+              key={treeVersion}
               value={parsedData}
               depth={0}
               isLast={true}
               defaultExpanded={true}
+              globalExpanded={globalExpanded}
             />
           </div>
         ) : (
@@ -231,19 +243,38 @@ export function JsonBlock({ block, onUpdate }: JsonBlockProps) {
           </div>
         )}
 
-        {/* Copy button */}
-        <button
-          onClick={handleCopy}
-          className="absolute top-2 right-2 h-6 w-6 flex items-center justify-center rounded
-                     opacity-0 group-hover/output:opacity-100
-                     hover:bg-gray-100 transition-all duration-150 cursor-pointer"
-        >
-          {copied ? (
-            <Check className="h-3.5 w-3.5 text-emerald-500" />
-          ) : (
-            <DuotoneIcon icon={Copy} size={13} />
-          )}
-        </button>
+        {/* Toolbar — top right */}
+        <div className="absolute top-2 right-2 flex items-center gap-0.5
+                        opacity-0 group-hover/output:opacity-100 transition-opacity duration-150">
+          <button
+            onClick={handleExpandAll}
+            title="Expand all"
+            className="h-6 w-6 flex items-center justify-center rounded
+                       hover:bg-gray-100 transition-colors cursor-pointer"
+          >
+            <ChevronsUpDown className="h-3.5 w-3.5 text-gray-400" />
+          </button>
+          <button
+            onClick={handleCollapseAll}
+            title="Collapse all"
+            className="h-6 w-6 flex items-center justify-center rounded
+                       hover:bg-gray-100 transition-colors cursor-pointer"
+          >
+            <ChevronsDownUp className="h-3.5 w-3.5 text-gray-400" />
+          </button>
+          <button
+            onClick={handleCopy}
+            title="Copy JSON"
+            className="h-6 w-6 flex items-center justify-center rounded
+                       hover:bg-gray-100 transition-colors cursor-pointer"
+          >
+            {copied ? (
+              <Check className="h-3.5 w-3.5 text-emerald-500" />
+            ) : (
+              <DuotoneIcon icon={Copy} size={13} />
+            )}
+          </button>
+        </div>
       </div>
     </div>
   );

@@ -6,6 +6,7 @@ import {
   MoreHorizontal,
   Plus,
   Play,
+  Loader2,
   Link2,
   ChevronsUpDown,
   Search,
@@ -13,6 +14,7 @@ import {
   Copy,
   Archive,
   Trash2,
+  Download,
 } from "lucide-react";
 import { createClient } from "@/lib/supabase/client";
 import type { Page, Notebook } from "@/lib/models/types";
@@ -227,10 +229,12 @@ interface PageHeaderProps {
   onCreateNotebook: () => void;
   onAddBlock?: () => void;
   onRunAll?: () => void;
+  runAllState?: import("@/components/blocks/block-list").RunAllState | null;
   onStarToggle?: (starred: boolean) => void;
   onDuplicatePage?: () => void;
   onArchivePage?: () => void;
   onDeletePage?: () => void;
+  sourceRefreshTrigger?: number;
 }
 
 export function PageHeader({
@@ -243,10 +247,12 @@ export function PageHeader({
   onCreateNotebook,
   onAddBlock,
   onRunAll,
+  runAllState,
   onStarToggle,
   onDuplicatePage,
   onArchivePage,
   onDeletePage,
+  sourceRefreshTrigger,
 }: PageHeaderProps) {
   const [linkedSourceCount, setLinkedSourceCount] = useState(0);
   const supabase = useMemo(() => createClient(), []);
@@ -316,7 +322,7 @@ export function PageHeader({
       setLinkedSourceCount(count);
     }
     countSources();
-  }, [supabase, page.id]);
+  }, [supabase, page.id, sourceRefreshTrigger]);
 
   const handleNotebookSelect = useCallback(
     (notebookId: string) => {
@@ -385,10 +391,30 @@ export function PageHeader({
             >
               <MoreHorizontal className="h-4 w-4" />
             </DropdownMenuTrigger>
-            <DropdownMenuContent align="end" sideOffset={4} className="min-w-[160px]">
+            <DropdownMenuContent align="end" sideOffset={4} className="min-w-[200px]">
               <DropdownMenuItem onClick={() => onDuplicatePage?.()} className="whitespace-nowrap">
                 <Copy className="h-4 w-4 text-gray-400" />
                 Duplicate page
+              </DropdownMenuItem>
+              <DropdownMenuItem
+                onClick={async () => {
+                  try {
+                    const res = await fetch(`/api/pages/${page.id}/export?format=markdown`);
+                    if (!res.ok) return;
+                    const text = await res.text();
+                    const blob = new Blob([text], { type: "text/markdown" });
+                    const url = URL.createObjectURL(blob);
+                    const a = document.createElement("a");
+                    a.href = url;
+                    a.download = `${page.title.replace(/[^a-z0-9]+/gi, "-").toLowerCase() || "page"}.md`;
+                    a.click();
+                    URL.revokeObjectURL(url);
+                  } catch { /* ignore */ }
+                }}
+                className="whitespace-nowrap"
+              >
+                <Download className="h-4 w-4 text-gray-400" />
+                Export as Markdown
               </DropdownMenuItem>
               <DropdownMenuItem onClick={() => onArchivePage?.()} className="whitespace-nowrap">
                 <Archive className="h-4 w-4 text-gray-400" />
@@ -428,17 +454,39 @@ export function PageHeader({
           Add block
         </button>
 
-        <button
-          onMouseDown={(e) => e.preventDefault()}
-          onClick={() => onRunAll?.()}
-          className="inline-flex items-center gap-1.5 h-8 px-3 rounded
-                     border border-gray-300 bg-white text-[13px] font-medium text-gray-700
-                     hover:bg-gray-50 hover:border-gray-400 transition-colors cursor-pointer
-                     shadow-sm"
-        >
-          <Play className="h-3.5 w-3.5 text-blue-500 fill-blue-500" />
-          Run all
-        </button>
+        {runAllState?.active ? (() => {
+          const hasFailed = runAllState.cells.some(c => c.status === "failed");
+          const completed = runAllState.cells.filter(c => c.status === "completed").length;
+          return hasFailed ? (
+            <div className="inline-flex items-center gap-2 h-8 px-3 rounded-md
+                           bg-red-500 text-white text-[13px] font-medium shadow-sm">
+              <span className="text-[14px] font-bold leading-none">!</span>
+              <span>
+                Failed — {completed} of {runAllState.cells.length} complete
+              </span>
+            </div>
+          ) : (
+            <div className="inline-flex items-center gap-2 h-8 px-3 rounded-md
+                           bg-blue-500 text-white text-[13px] font-medium shadow-sm">
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              <span>
+                Running {Math.min(runAllState.currentIndex + 1, runAllState.cells.length)} of {runAllState.cells.length}
+              </span>
+            </div>
+          );
+        })() : (
+          <button
+            onMouseDown={(e) => e.preventDefault()}
+            onClick={() => onRunAll?.()}
+            className="inline-flex items-center gap-1.5 h-8 px-3 rounded
+                       border border-gray-300 bg-white text-[13px] font-medium text-gray-700
+                       hover:bg-gray-50 hover:border-gray-400 transition-colors cursor-pointer
+                       shadow-sm"
+          >
+            <Play className="h-3.5 w-3.5 text-blue-500 fill-blue-500" />
+            Run all
+          </button>
+        )}
 
         <span
           className="inline-flex items-center gap-1.5 h-8 px-3 text-[13px] text-gray-400"
@@ -447,6 +495,32 @@ export function PageHeader({
           {linkedSourceCount} linked source{linkedSourceCount !== 1 ? "s" : ""}
         </span>
       </div>
+
+      {/* Run All progress bar */}
+      {runAllState && runAllState.cells.length > 0 && (runAllState.active || runAllState.cells.some(c => c.status !== "queued")) && (
+        <div className="px-6 pb-3">
+          <div className="flex items-center gap-3">
+            <div className="flex-1 h-1.5 bg-gray-100 rounded-full overflow-hidden">
+              <div
+                className={`h-full rounded-full transition-all duration-500 ease-out ${
+                  runAllState.cells.some(c => c.status === "failed")
+                    ? "bg-gradient-to-r from-blue-500 to-red-500"
+                    : "bg-gradient-to-r from-blue-500 to-blue-400"
+                }`}
+                style={{
+                  width: `${Math.round(
+                    (runAllState.cells.filter(c => c.status === "completed" || c.status === "failed" || c.status === "skipped").length /
+                      runAllState.cells.length) * 100
+                  )}%`,
+                }}
+              />
+            </div>
+            <span className="text-[11px] text-gray-400 tabular-nums shrink-0">
+              {runAllState.cells.filter(c => c.status === "completed" || c.status === "failed" || c.status === "skipped").length} of {runAllState.cells.length} complete
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* Divider */}
       <div className="border-t border-gray-100" />

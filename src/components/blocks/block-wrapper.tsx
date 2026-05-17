@@ -1,6 +1,7 @@
 "use client";
 
-import { useState, useRef, useEffect } from "react";
+import { useState, useCallback, useRef, useEffect, useLayoutEffect } from "react";
+import { createPortal } from "react-dom";
 import {
   GripVertical,
   MoreHorizontal,
@@ -19,6 +20,11 @@ import {
   AlertCircle,
   SlidersHorizontal,
   ChevronRight,
+  Globe,
+  Code2,
+  ImageIcon,
+  X,
+  RotateCcw,
 } from "lucide-react";
 import type { DraggableAttributes } from "@dnd-kit/core";
 import { useSortable } from "@dnd-kit/sortable";
@@ -68,8 +74,14 @@ export function BlockTypeIcon({ blockType }: { blockType: string }) {
     case "bulleted_list":
     case "numbered_list":
       return <List className="h-4 w-4 text-blue-500" />;
+    case "source_card":
+      return <Globe className="h-4 w-4 text-blue-500" />;
     case "error":
       return <AlertCircle className="h-4 w-4 text-red-500" />;
+    case "code":
+      return <Code2 className="h-4 w-4 text-blue-500" />;
+    case "image":
+      return <ImageIcon className="h-4 w-4 text-blue-500" />;
     case "input":
     case "input_group":
       return <SlidersHorizontal className="h-4 w-4 text-blue-500" />;
@@ -92,12 +104,15 @@ interface BlockWrapperProps {
   blockType: string;
   typeLabel: string;
   blockLabel?: string;
+  blockVersion?: number;
+  blockUpdatedAt?: string;
   onLabelChange?: (label: string) => void;
   children: React.ReactNode;
   onChangeType: (newType: string) => void;
   onDelete?: () => void;
   onDuplicate?: () => void;
   onEdit?: () => void;
+  onBlockUpdate?: (content: Record<string, unknown>) => void;
   extraHeaderContent?: React.ReactNode;
 }
 
@@ -107,16 +122,32 @@ export function BlockWrapper({
   blockType,
   typeLabel,
   blockLabel,
+  blockVersion = 1,
   onLabelChange,
   children,
   onChangeType,
   onDelete,
   onDuplicate,
   onEdit,
+  onBlockUpdate,
   extraHeaderContent,
 }: BlockWrapperProps) {
   const [showMenu, setShowMenu] = useState(false);
   const [showPicker, setShowPicker] = useState(false);
+  const [viewingVersionData, setViewingVersionData] = useState<{ version: number; content: Record<string, unknown> } | null>(null);
+
+  const handleRestore = useCallback(async (version: number) => {
+    try {
+      await fetch(`/api/blocks/${blockId}/versions/save`, { method: "POST" });
+      const res = await fetch(`/api/blocks/${blockId}/versions/${version}`);
+      if (!res.ok) return;
+      const versionData = await res.json();
+      if (versionData.content && onBlockUpdate) {
+        onBlockUpdate(versionData.content as Record<string, unknown>);
+      }
+      setViewingVersionData(null);
+    } catch { /* ignore */ }
+  }, [blockId, onBlockUpdate]);
 
   const {
     attributes,
@@ -266,6 +297,16 @@ export function BlockWrapper({
             <div className="ml-3 flex items-center">{extraHeaderContent}</div>
           )}
           <div className="flex-1" />
+          {blockVersion > 1 && (
+            <BlockVersionTabs
+              blockId={blockId}
+              blockVersion={blockVersion}
+              viewingVersion={viewingVersionData?.version ?? null}
+              onViewVersion={(version, content) => setViewingVersionData({ version, content })}
+              onViewCurrent={() => setViewingVersionData(null)}
+              onRestore={handleRestore}
+            />
+          )}
           <div className="shrink-0 flex items-center gap-0.5
                           transition-opacity">
             <ActionMenu showMenu={showMenu} setShowMenu={setShowMenu}
@@ -282,9 +323,45 @@ export function BlockWrapper({
         </div>
 
         {/* Content area with resize handle */}
-        <ResizableContent>
-          {children}
-        </ResizableContent>
+        {viewingVersionData ? (
+          <div className="relative">
+            <div className="px-4 py-4 bg-amber-50/30">
+              <div className="flex items-center gap-2.5 mb-2">
+                <span className="text-[12px] font-mono font-semibold text-gray-500">
+                  v{viewingVersionData.version}
+                </span>
+                <span className="text-[12px] text-gray-600 font-medium">
+                  {summarizeContent(blockType, viewingVersionData.content)}
+                </span>
+              </div>
+              <p className="text-[12px] text-gray-400">
+                Viewing a previous version. Click Restore in the version history to make this the current version.
+              </p>
+            </div>
+            <div className="flex items-center gap-4 px-4 py-2 border-t border-gray-100 bg-gray-50/50">
+              <button
+                onClick={() => setViewingVersionData(null)}
+                className="flex items-center gap-1.5 text-[11px] text-gray-500 hover:text-gray-700
+                           font-medium transition-colors cursor-pointer"
+              >
+                <X className="h-3 w-3" />
+                Back to current
+              </button>
+              <button
+                onClick={() => handleRestore(viewingVersionData.version)}
+                className="flex items-center gap-1.5 text-[11px] text-blue-600 hover:text-blue-700
+                           font-medium transition-colors cursor-pointer"
+              >
+                <RotateCcw className="h-3 w-3" />
+                Restore this version
+              </button>
+            </div>
+          </div>
+        ) : (
+          <ResizableContent>
+            {children}
+          </ResizableContent>
+        )}
       </div>
     </div>
   );
@@ -451,6 +528,12 @@ function ResizableContent({ children }: { children: React.ReactNode }) {
       document.removeEventListener("mouseup", handleMouseUp);
     };
   }, [isResizing]);
+
+  useEffect(() => {
+    if (!height || !outerRef.current) return;
+    const runningChild = outerRef.current.querySelector("[data-running]");
+    if (runningChild) setHeight(null);
+  }, [height]);
 
   const handleResizeStart = (e: React.MouseEvent) => {
     e.preventDefault();
@@ -623,5 +706,264 @@ function ActionMenu({
         </div>
       )}
     </div>
+  );
+}
+
+// ── Block Version Tabs + History Popover ──
+
+interface VersionListItem {
+  version: number;
+  type: string;
+  created_at: string;
+  summary?: string;
+}
+
+function summarizeContent(type: string, content: Record<string, unknown>): string {
+  switch (type) {
+    case "table": {
+      const cols = Array.isArray(content.columns) ? content.columns.length : 0;
+      const rows = Array.isArray(content.rows) ? content.rows.length : 0;
+      return `Table · ${cols} columns · ${rows} rows`;
+    }
+    case "output": {
+      const data = typeof content.data === "string" ? content.data : "";
+      const chars = data.length;
+      return `Text · ${chars} chars`;
+    }
+    case "json": {
+      const data = content.data;
+      const keys = data && typeof data === "object" && !Array.isArray(data) ? Object.keys(data).length : 0;
+      return `JSON · ${keys} keys`;
+    }
+    case "todo": {
+      const items = Array.isArray(content.items) ? content.items : [];
+      const done = items.filter((i: Record<string, unknown>) => i.done).length;
+      return `Todo · ${items.length} items · ${done} done`;
+    }
+    default:
+      return type.charAt(0).toUpperCase() + type.slice(1);
+  }
+}
+
+function formatRelativeTime(dateStr: string): string {
+  const now = Date.now();
+  const then = new Date(dateStr).getTime();
+  const diff = now - then;
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins} min ago`;
+  const hrs = Math.floor(mins / 60);
+  if (hrs < 24) return `${hrs}h ago`;
+  const days = Math.floor(hrs / 24);
+  return `${days}d ago`;
+}
+
+function BlockVersionTabs({
+  blockId,
+  blockVersion,
+  viewingVersion,
+  onViewVersion,
+  onViewCurrent,
+  onRestore,
+}: {
+  blockId: string;
+  blockVersion: number;
+  viewingVersion: number | null;
+  onViewVersion: (version: number, content: Record<string, unknown>) => void;
+  onViewCurrent: () => void;
+  onRestore: (version: number) => void;
+}) {
+  const [showPopover, setShowPopover] = useState(false);
+  const [versions, setVersions] = useState<VersionListItem[]>([]);
+  const [loadingVersions, setLoadingVersions] = useState(false);
+  const [popoverStyle, setPopoverStyle] = useState<React.CSSProperties | null>(null);
+  const triggerRef = useRef<HTMLButtonElement>(null);
+  const popoverRef = useRef<HTMLDivElement>(null);
+
+  const allVersionNumbers = Array.from({ length: blockVersion - 1 }, (_, i) => i + 1);
+  const MAX_INLINE_TABS = 2;
+  const inlineTabs = allVersionNumbers.length > MAX_INLINE_TABS
+    ? allVersionNumbers.slice(-MAX_INLINE_TABS)
+    : allVersionNumbers;
+  const hasHiddenVersions = allVersionNumbers.length > MAX_INLINE_TABS;
+
+  useLayoutEffect(() => {
+    if (!showPopover || !triggerRef.current) {
+      setPopoverStyle(null);
+      return;
+    }
+    const update = () => {
+      if (!triggerRef.current) return;
+      const rect = triggerRef.current.getBoundingClientRect();
+      const width = 360;
+      const height = 300;
+      const gap = 6;
+      const margin = 8;
+      const top = Math.min(rect.bottom + gap, window.innerHeight - margin - height);
+      const left = Math.max(margin, Math.min(rect.right - width, window.innerWidth - margin - width));
+      setPopoverStyle({ position: "fixed" as const, top, left, width, zIndex: 1000 });
+    };
+    update();
+    window.addEventListener("resize", update);
+    window.addEventListener("scroll", update, true);
+    return () => {
+      window.removeEventListener("resize", update);
+      window.removeEventListener("scroll", update, true);
+    };
+  }, [showPopover]);
+
+  useEffect(() => {
+    if (!showPopover) return;
+    function handleClick(e: MouseEvent) {
+      if (
+        popoverRef.current && !popoverRef.current.contains(e.target as Node) &&
+        triggerRef.current && !triggerRef.current.contains(e.target as Node)
+      ) {
+        setShowPopover(false);
+      }
+    }
+    document.addEventListener("mousedown", handleClick);
+    return () => document.removeEventListener("mousedown", handleClick);
+  }, [showPopover]);
+
+  const fetchVersions = useCallback(async () => {
+    if (versions.length > 0 || loadingVersions) return;
+    setLoadingVersions(true);
+    try {
+      const res = await fetch(`/api/blocks/${blockId}/versions`);
+      if (res.ok) {
+        const result = await res.json();
+        setVersions(result.versions || []);
+      }
+    } finally {
+      setLoadingVersions(false);
+    }
+  }, [blockId, versions.length, loadingVersions]);
+
+  const loadVersion = useCallback(async (version: number) => {
+    try {
+      const res = await fetch(`/api/blocks/${blockId}/versions/${version}`);
+      if (res.ok) {
+        const data = await res.json();
+        onViewVersion(version, (data as { content: Record<string, unknown> }).content);
+      }
+    } catch { /* ignore */ }
+  }, [blockId, onViewVersion]);
+
+  return (
+    <>
+      <div className="flex items-center mr-2">
+        {/* Version tab group — shared border container */}
+        <div className="flex items-center h-7 border border-gray-200 rounded-lg overflow-hidden">
+          {hasHiddenVersions && (
+            <button
+              ref={triggerRef}
+              onClick={() => { if (!showPopover) fetchVersions(); setShowPopover(!showPopover); }}
+              className="h-full px-2 text-[11px] text-gray-400 hover:text-gray-600
+                         hover:bg-gray-50 border-r border-gray-200 transition-colors cursor-pointer"
+            >
+              ···
+            </button>
+          )}
+          {inlineTabs.map((v) => (
+            <button
+              key={v}
+              onClick={() => loadVersion(v)}
+              className={`h-full px-2.5 text-[11px] font-mono font-medium border-r border-gray-200
+                         transition-all cursor-pointer
+                         ${viewingVersion === v
+                           ? "bg-gray-100 text-gray-800"
+                           : "text-gray-400 hover:text-gray-600 hover:bg-gray-50"}`}
+            >
+              v{v}
+            </button>
+          ))}
+          <button
+            ref={hasHiddenVersions ? undefined : triggerRef}
+            onClick={onViewCurrent}
+            className={`h-full px-3 text-[11px] font-medium transition-all cursor-pointer
+                       ${viewingVersion === null
+                         ? "bg-blue-500 text-white"
+                         : "text-gray-400 hover:text-gray-600 hover:bg-gray-50"}`}
+          >
+            Current
+          </button>
+        </div>
+
+      </div>
+
+      {/* Version history popover */}
+      {showPopover && popoverStyle && typeof document !== "undefined" && createPortal(
+        <div
+          ref={popoverRef}
+          style={popoverStyle}
+          className="bg-white border border-gray-200 rounded-xl shadow-lg
+                     animate-in fade-in duration-75"
+        >
+          <div className="flex items-center justify-between px-4 py-3 border-b border-gray-100">
+            <span className="text-[14px] font-semibold text-gray-900">Version history</span>
+            <button
+              onClick={() => setShowPopover(false)}
+              className="h-6 w-6 flex items-center justify-center rounded-md hover:bg-gray-100
+                         transition-colors cursor-pointer"
+            >
+              <X className="h-3.5 w-3.5 text-gray-400" />
+            </button>
+          </div>
+
+          {loadingVersions ? (
+            <div className="px-4 py-6 text-[13px] text-gray-400 text-center">Loading...</div>
+          ) : (
+            <div className="max-h-72 overflow-y-auto divide-y divide-gray-100">
+              {/* Current version */}
+              <button
+                onClick={() => { onViewCurrent(); setShowPopover(false); }}
+                className={`flex w-full items-start gap-3 px-4 py-3 transition-colors cursor-pointer
+                           ${viewingVersion === null ? "bg-blue-50/50" : "hover:bg-gray-50"}`}
+              >
+                <span className="text-[15px] font-mono font-bold text-blue-600 mt-0.5 shrink-0">v{blockVersion}</span>
+                <div className="flex-1 min-w-0 text-left">
+                  <span className="text-[12px] text-gray-500">Latest version</span>
+                </div>
+                <span className="text-[11px] font-medium text-blue-600 bg-blue-50 border border-blue-200
+                                 px-2 py-0.5 rounded-md shrink-0">Current</span>
+              </button>
+
+              {/* Previous versions — newest first */}
+              {[...versions].reverse().map((v) => (
+                <div
+                  key={v.version}
+                  className={`flex w-full items-start gap-3 px-4 py-3 transition-colors
+                             ${viewingVersion === v.version ? "bg-gray-50" : "hover:bg-gray-50"}`}
+                >
+                  <button
+                    onClick={() => { loadVersion(v.version); setShowPopover(false); }}
+                    className="flex items-start gap-3 flex-1 min-w-0 cursor-pointer text-left"
+                  >
+                    <span className="text-[15px] font-mono font-bold text-gray-400 mt-0.5 shrink-0">v{v.version}</span>
+                    <div className="flex flex-col min-w-0 gap-0.5">
+                      <span className="text-[12px] text-gray-700 font-medium truncate">
+                        {v.summary || v.type}
+                      </span>
+                      <span className="text-[11px] text-gray-400">{formatRelativeTime(v.created_at)}</span>
+                    </div>
+                  </button>
+                  <button
+                    onClick={() => { onRestore(v.version); setShowPopover(false); }}
+                    className="flex items-center gap-1.5 h-6 px-2.5 text-[11px] text-blue-600
+                               font-medium border border-blue-200 rounded-md bg-white
+                               hover:bg-blue-50 transition-colors cursor-pointer shrink-0 mt-0.5"
+                  >
+                    <RotateCcw className="h-3 w-3" />
+                    Restore
+                  </button>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>,
+        document.body
+      )}
+    </>
   );
 }

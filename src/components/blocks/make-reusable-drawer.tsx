@@ -30,6 +30,7 @@ import {
   Search,
   BookOpen,
   Terminal,
+  ImageIcon,
   SlidersHorizontal,
   GripVertical,
 } from "lucide-react";
@@ -51,6 +52,14 @@ interface InputRow {
   min?: number;
   max?: number;
   description?: string;
+  validation?: {
+    min?: number;
+    max?: number;
+    minLength?: number;
+    maxLength?: number;
+    pattern?: string;
+    patternMessage?: string;
+  };
 }
 
 interface AttachedSourceInfo {
@@ -95,6 +104,8 @@ const AVAILABLE_TOOLS: ToolDef[] = [
   { id: "create_numbered_list", label: "Num. list", icon: <ListOrdered className="h-3 w-3" />, category: "create" },
   { id: "create_callout", label: "Callout", icon: <Info className="h-3 w-3" />, category: "create" },
   { id: "create_source_card", label: "Source card", icon: <Link className="h-3 w-3" />, category: "create" },
+  { id: "create_code_output", label: "Code", icon: <Terminal className="h-3 w-3" />, category: "create" },
+  { id: "generate_image", label: "Image", icon: <ImageIcon className="h-3 w-3" />, category: "create" },
   { id: "read_block", label: "Read block", icon: <BookOpen className="h-3 w-3" />, category: "read" },
   { id: "read_page", label: "Read page", icon: <BookOpen className="h-3 w-3" />, category: "read" },
   { id: "read_inputs", label: "Read inputs", icon: <SlidersHorizontal className="h-3 w-3" />, category: "read" },
@@ -367,6 +378,104 @@ function ConvertPopover({
 }
 
 /* ═══════════════════════════════════════════════════════════
+   Validation rules (collapsed by default)
+   ═══════════════════════════════════════════════════════════ */
+
+function ValidationRules({
+  row,
+  index,
+  onUpdate,
+}: {
+  row: InputRow;
+  index: number;
+  onUpdate: (index: number, field: keyof InputRow, value: unknown) => void;
+}) {
+  const v = row.validation;
+  const hasRules = v && (v.min !== undefined || v.max !== undefined || v.minLength !== undefined || v.maxLength !== undefined || v.pattern);
+  const [open, setOpen] = useState(!!hasRules);
+
+  return (
+    <div className="pt-1">
+      <button
+        type="button"
+        onClick={() => setOpen(!open)}
+        className="flex items-center gap-1 text-[10px] font-semibold uppercase tracking-wider text-gray-400 hover:text-gray-600 cursor-pointer transition-colors"
+      >
+        <ChevronRight className={`h-2.5 w-2.5 transition-transform duration-150 ${open ? "rotate-90" : ""}`} />
+        Validation
+        {hasRules && <span className="h-1.5 w-1.5 rounded-full bg-blue-400" />}
+      </button>
+      {open && (
+        <div className="mt-1.5">
+          {row.type === "number" && (
+            <div className="flex items-center gap-2">
+              <label className="flex items-center gap-1.5">
+                <span className="text-[11px] text-gray-500">Min</span>
+                <input
+                  type="number"
+                  value={v?.min ?? ""}
+                  onChange={(e) => onUpdate(index, "validation", { ...v, min: e.target.value === "" ? undefined : Number(e.target.value) })}
+                  className="w-16 px-2 py-1 text-[12px] text-gray-600 border border-gray-200 rounded
+                             bg-white outline-none focus:border-blue-500"
+                />
+              </label>
+              <label className="flex items-center gap-1.5">
+                <span className="text-[11px] text-gray-500">Max</span>
+                <input
+                  type="number"
+                  value={v?.max ?? ""}
+                  onChange={(e) => onUpdate(index, "validation", { ...v, max: e.target.value === "" ? undefined : Number(e.target.value) })}
+                  className="w-16 px-2 py-1 text-[12px] text-gray-600 border border-gray-200 rounded
+                             bg-white outline-none focus:border-blue-500"
+                />
+              </label>
+            </div>
+          )}
+          {row.type === "text" && (
+            <>
+              <div className="flex items-center gap-2">
+                <label className="flex items-center gap-1.5">
+                  <span className="text-[11px] text-gray-500">Min len</span>
+                  <input
+                    type="number"
+                    value={v?.minLength ?? ""}
+                    onChange={(e) => onUpdate(index, "validation", { ...v, minLength: e.target.value === "" ? undefined : Number(e.target.value) })}
+                    className="w-16 px-2 py-1 text-[12px] text-gray-600 border border-gray-200 rounded
+                               bg-white outline-none focus:border-blue-500"
+                    min={0}
+                  />
+                </label>
+                <label className="flex items-center gap-1.5">
+                  <span className="text-[11px] text-gray-500">Max len</span>
+                  <input
+                    type="number"
+                    value={v?.maxLength ?? ""}
+                    onChange={(e) => onUpdate(index, "validation", { ...v, maxLength: e.target.value === "" ? undefined : Number(e.target.value) })}
+                    className="w-16 px-2 py-1 text-[12px] text-gray-600 border border-gray-200 rounded
+                               bg-white outline-none focus:border-blue-500"
+                    min={0}
+                  />
+                </label>
+              </div>
+              <div className="mt-1.5">
+                <input
+                  type="text"
+                  value={v?.pattern ?? ""}
+                  onChange={(e) => onUpdate(index, "validation", { ...v, pattern: e.target.value || undefined })}
+                  placeholder="Regex pattern (optional)"
+                  className="w-full px-2.5 py-1.5 text-[12px] font-mono text-gray-600 border border-gray-200 rounded-md
+                             bg-white outline-none focus:border-blue-500 placeholder:text-gray-300"
+                />
+              </div>
+            </>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
    Input pill row
    ═══════════════════════════════════════════════════════════ */
 
@@ -476,6 +585,10 @@ function InputTableRow({
                          bg-white outline-none focus:border-blue-500 placeholder:text-gray-300"
             />
           )}
+          {/* Validation rules — collapsed by default */}
+          {(row.type === "text" || row.type === "number") && (
+            <ValidationRules row={row} index={index} onUpdate={onUpdate} />
+          )}
           </div>
         </div>
       </div>
@@ -570,6 +683,7 @@ export function MakeReusableDrawer({
           options: inp.options,
           min: inp.min,
           max: inp.max,
+          validation: inp.validation,
         }))
       );
       setOutputSchema(editCommand.output_schema || {});
@@ -767,16 +881,21 @@ export function MakeReusableDrawer({
       const filteredInputs = sourceRequired
         ? inputs.filter((row) => !(row.type === "text" && SOURCE_NAME_RE.test(row.name)))
         : inputs;
-      const inputsPayload = filteredInputs.map((row) => ({
-        name: row.name,
-        type: row.type,
-        required: row.required,
-        description: row.description,
-        default_value: row.default_value,
-        min: row.min,
-        max: row.max,
-        options: row.options,
-      }));
+      const inputsPayload = filteredInputs.map((row) => {
+        const v = row.validation;
+        const hasValidation = v && (v.min !== undefined || v.max !== undefined || v.minLength !== undefined || v.maxLength !== undefined || v.pattern);
+        return {
+          name: row.name,
+          type: row.type,
+          required: row.required,
+          description: row.description,
+          default_value: row.default_value,
+          min: row.min,
+          max: row.max,
+          options: row.options,
+          ...(hasValidation ? { validation: v } : {}),
+        };
+      });
       const isEdit = !!editCommand;
       const url = isEdit ? `/api/commands?id=${editCommand.id}` : "/api/commands";
       const method = isEdit ? "PUT" : "POST";

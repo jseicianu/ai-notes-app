@@ -6,8 +6,8 @@ type JsonObject = Record<string, unknown>;
 
 interface CreateRunParams {
   workspaceId: string;
-  pageId: string;
-  triggerBlockId: string;
+  pageId: string | null;
+  triggerBlockId: string | null;
   commandId?: string;
   parentRunId?: string;
   type: RunType;

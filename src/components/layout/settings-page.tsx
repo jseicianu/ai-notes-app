@@ -16,6 +16,8 @@ import {
   FileInput,
   Braces,
   GitBranch,
+  Database,
+  Loader2,
 } from "lucide-react";
 import { Anthropic, OpenAI, Google, Ollama } from "@lobehub/icons";
 import { createClient } from "@/lib/supabase/client";
@@ -169,10 +171,11 @@ function SummaryRow({ label, value }: { label: string; value: string }) {
 
 // ─── Quick Action ──────────────────────────────────────────────────────────
 
-function QuickAction({ icon: Icon, label, onClick }: {
+function QuickAction({ icon: Icon, label, onClick, iconClassName }: {
   icon: React.ComponentType<{ className?: string }>;
   label: string;
   onClick?: () => void;
+  iconClassName?: string;
 }) {
   return (
     <button
@@ -180,7 +183,7 @@ function QuickAction({ icon: Icon, label, onClick }: {
       className="flex w-full items-center gap-2.5 px-2.5 py-2 rounded-md text-[13px]
                  text-gray-700 hover:bg-gray-50 transition-colors cursor-pointer"
     >
-      <Icon className="h-4 w-4 text-gray-400" />
+      <Icon className={iconClassName || "h-4 w-4 text-gray-400"} />
       {label}
     </button>
   );
@@ -268,6 +271,8 @@ export function SettingsPage({ workspaceId, workspaceName }: SettingsPageProps) 
   const [commandRunCount, setCommandRunCount] = useState(0);
   const [mostUsedCommand, setMostUsedCommand] = useState<string>("");
   const [commandSearchQuery, setCommandSearchQuery] = useState("");
+  const [reindexing, setReindexing] = useState(false);
+  const [reindexResult, setReindexResult] = useState<string | null>(null);
 
   // API keys local state
   const [apiKeys, setApiKeys] = useState({
@@ -403,6 +408,14 @@ export function SettingsPage({ workspaceId, workspaceName }: SettingsPageProps) 
     setSettings(newSettings);
   };
 
+  const saveDefaultModel = async (modelId: string) => {
+    setDefaultModel(modelId);
+    const supabase = createClient();
+    const newSettings = { ...settings, defaultModel: modelId };
+    await supabase.from("workspaces").update({ settings: newSettings }).eq("id", workspaceId);
+    setSettings(newSettings);
+  };
+
   const copyWorkspaceId = () => {
     navigator.clipboard.writeText(workspaceId);
     setCopied(true);
@@ -504,7 +517,7 @@ export function SettingsPage({ workspaceId, workspaceName }: SettingsPageProps) 
                     {MODELS.map((model) => (
                       <button
                         key={model.id}
-                        onClick={() => { setDefaultModel(model.id); setModelDropdownOpen(false); }}
+                        onClick={() => { saveDefaultModel(model.id); setModelDropdownOpen(false); }}
                         className={`flex w-full items-center gap-2 px-3 py-1.5 text-[13px]
                                     transition-colors cursor-pointer ${
                                       defaultModel === model.id ? "bg-blue-50" : "hover:bg-gray-50"
@@ -622,6 +635,32 @@ export function SettingsPage({ workspaceId, workspaceName }: SettingsPageProps) 
 
           <div className="space-y-1">
             <QuickAction icon={Settings} label="Manage API keys" onClick={() => setActiveTab("ai-models")} />
+            <QuickAction
+              icon={reindexing ? Loader2 : Database}
+              iconClassName={reindexing ? "h-4 w-4 text-gray-400 animate-spin" : undefined}
+              label={reindexing ? "Re-indexing…" : "Re-index workspace"}
+              onClick={async () => {
+                if (reindexing) return;
+                setReindexing(true);
+                setReindexResult(null);
+                try {
+                  const res = await fetch("/api/indexing/batch", {
+                    method: "POST",
+                    headers: { "Content-Type": "application/json" },
+                    body: JSON.stringify({ workspaceId }),
+                  });
+                  const data = await res.json();
+                  setReindexResult(`Indexed ${data.processed} items (${data.skipped} skipped)`);
+                } catch {
+                  setReindexResult("Re-index failed");
+                } finally {
+                  setReindexing(false);
+                }
+              }}
+            />
+            {reindexResult && (
+              <p className="text-[12px] text-gray-500 px-2.5">{reindexResult}</p>
+            )}
             <ComingSoonTooltip>
               <QuickAction icon={Globe} label="Invite member" />
             </ComingSoonTooltip>
@@ -702,7 +741,7 @@ export function SettingsPage({ workspaceId, workspaceName }: SettingsPageProps) 
                                     rounded-md shadow-lg z-50 py-1" onMouseLeave={() => setModelDropdownOpen(false)}>
                       {MODELS.map((model) => (
                         <button key={model.id}
-                          onClick={() => { setDefaultModel(model.id); setModelDropdownOpen(false); }}
+                          onClick={() => { saveDefaultModel(model.id); setModelDropdownOpen(false); }}
                           className={`flex w-full items-center gap-2 px-3 py-1.5 text-[13px] cursor-pointer
                                       ${defaultModel === model.id ? "bg-blue-50" : "hover:bg-gray-50"}`}>
                           <model.Icon size={16} />

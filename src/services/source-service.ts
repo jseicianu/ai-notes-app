@@ -1,3 +1,4 @@
+import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Block, FileRecord } from "@/lib/models/types";
 import { createClient } from "@/lib/supabase/server";
 import { embedContent, searchWorkspace } from "@/services/embedding-service";
@@ -9,7 +10,8 @@ export type SourceReference =
   | { type: "file"; fileId: string }
   | { type: "url"; url: string }
   | { type: "paste"; content: string }
-  | { type: "rag"; query: string; limit?: number };
+  | { type: "rag"; query: string; limit?: number }
+  | { type: "image"; storageUrl: string; mimeType: string };
 
 export interface ResolvedSource {
   type: SourceReference["type"];
@@ -26,17 +28,18 @@ export interface ResolvedSource {
 
 export async function resolveSources(
   sources: SourceReference[],
-  workspaceId: string
+  workspaceId: string,
+  client?: SupabaseClient
 ): Promise<ResolvedSource[]> {
   const resolved: ResolvedSource[] = [];
 
   for (const source of sources) {
     switch (source.type) {
       case "block":
-        resolved.push(await resolveBlockSource(source.blockId, workspaceId));
+        resolved.push(await resolveBlockSource(source.blockId, workspaceId, client));
         break;
       case "file":
-        resolved.push(await resolveFileSource(source.fileId, workspaceId));
+        resolved.push(await resolveFileSource(source.fileId, workspaceId, client));
         break;
       case "url":
         resolved.push(await resolveUrlSource(source.url));
@@ -51,17 +54,32 @@ export async function resolveSources(
       case "rag":
         resolved.push(await resolveRagSource(source, workspaceId));
         break;
+      case "image":
+        resolved.push(resolveImageSource(source));
+        break;
     }
   }
 
   return resolved;
 }
 
+function resolveImageSource(
+  source: Extract<SourceReference, { type: "image" }>
+): ResolvedSource {
+  return {
+    type: "image",
+    label: "Uploaded image",
+    content: "",
+    metadata: { url: source.storageUrl, mimeType: source.mimeType },
+  };
+}
+
 async function resolveBlockSource(
   blockId: string,
-  workspaceId: string
+  workspaceId: string,
+  client?: SupabaseClient
 ): Promise<ResolvedSource> {
-  const supabase = await createClient();
+  const supabase = client ?? (await createClient());
   const { data, error } = await supabase
     .from("blocks")
     .select("*")
@@ -73,6 +91,41 @@ async function resolveBlockSource(
   if (!data) throw new Error("Source block not found");
 
   const block = data as Block;
+  if (block.type === "image") {
+    const storagePath =
+      stringValue(block.content?.storage_path) || stringValue(block.content?.storagePath);
+    const mimeType =
+      stringValue(block.content?.mime_type) ||
+      stringValue(block.content?.mimeType) ||
+      "image/png";
+    const filename = stringValue(block.content?.filename) || "Image";
+    const caption = stringValue(block.content?.caption);
+
+    if (!storagePath) {
+      throw new Error("Image source block is missing a storage path");
+    }
+
+    const { data: signedUrl, error: signedUrlError } = await supabase.storage
+      .from("files")
+      .createSignedUrl(storagePath, 60 * 60);
+
+    if (signedUrlError || !signedUrl?.signedUrl) {
+      throw new Error(signedUrlError?.message ?? "Unable to create image source URL");
+    }
+
+    return {
+      type: "image",
+      label: caption || filename,
+      content: caption || "",
+      metadata: {
+        blockId: block.id,
+        url: signedUrl.signedUrl,
+        filename,
+        mimeType,
+      },
+    };
+  }
+
   return {
     type: "block",
     label: `${block.type} block`,
@@ -85,9 +138,10 @@ async function resolveBlockSource(
 
 async function resolveFileSource(
   fileId: string,
-  workspaceId: string
+  workspaceId: string,
+  client?: SupabaseClient
 ): Promise<ResolvedSource> {
-  const supabase = await createClient();
+  const supabase = client ?? (await createClient());
   const { data, error } = await supabase
     .from("files")
     .select("*")
@@ -181,7 +235,7 @@ async function resolveRagSource(
   };
 }
 
-function extractBlockText(block: Block): string {
+export function extractBlockText(block: Block): string {
   const content = block.content;
   if (!content) return "";
 
@@ -236,11 +290,16 @@ function extractBlockText(block: Block): string {
     case "source_card":
       return [
         stringValue(content.title),
-        stringValue(content.summary),
+        stringValue(content.full_content) || stringValue(content.summary),
         stringValue(content.url) ? `URL: ${content.url}` : null,
       ]
         .filter(Boolean)
         .join("\n");
+    case "code": {
+      const lang = stringValue(content.language) || "plain";
+      const codeText = stringValue(content.code) || "";
+      return `\`\`\`${lang}\n${codeText}\n\`\`\``;
+    }
     default:
       return safeStringify(content);
   }
